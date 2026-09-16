@@ -8,7 +8,8 @@ param(
     [switch]$SkipBuild,
     [switch]$Full,
     [switch]$ValidateOnly,
-    [string]$CloudRoot = ""
+    [string]$CloudRoot = "",
+    [string]$SigningKey = ""
 )
 
 $ErrorActionPreference = "Stop"
@@ -133,6 +134,22 @@ function Resolve-StagedLayout([string]$ProjectRoot, [string]$ExplicitGameExe, [b
     }
 }
 
+function Write-RsaSignature([string]$Path, [string]$PrivateKeyPath) {
+    $Rsa = [System.Security.Cryptography.RSACryptoServiceProvider]::new()
+    try {
+        $Rsa.FromXmlString((Get-Content -LiteralPath $PrivateKeyPath -Raw))
+        $Bytes = [System.IO.File]::ReadAllBytes($Path)
+        $Signature = $Rsa.SignData($Bytes, [System.Security.Cryptography.CryptoConfig]::MapNameToOID("SHA256"))
+        [System.IO.File]::WriteAllText(
+            "$Path.sig",
+            [Convert]::ToBase64String($Signature),
+            [System.Text.UTF8Encoding]::new($false))
+    } finally {
+        $Rsa.PersistKeyInCsp = $false
+        $Rsa.Dispose()
+    }
+}
+
 $Project = Resolve-ProjectFile $Project
 $ProjectRoot = Split-Path -Parent $Project
 $ProjectName = [System.IO.Path]::GetFileNameWithoutExtension($Project)
@@ -228,6 +245,32 @@ if ($Full) {
 
     $FullDir = Join-Path $CloudRoot "Full"
     New-Item -ItemType Directory -Force -Path $FullDir | Out-Null
+
+    $VersionDir = Join-Path $FullDir $BuildId
+    $FilesDir = Join-Path $VersionDir "Files"
+    if (Test-Path -LiteralPath $VersionDir) { Remove-Item -LiteralPath $VersionDir -Recurse -Force }
+    New-Item -ItemType Directory -Force -Path $FilesDir | Out-Null
+    foreach ($Item in Get-ChildItem -LiteralPath $Layout.StagedDir) {
+        Copy-Item -LiteralPath $Item.FullName -Destination $FilesDir -Recurse -Force
+    }
+    Copy-Item -LiteralPath $LauncherExe -Destination (Join-Path $FilesDir "Launcher.exe") -Force
+
+    $FullEntries = @(Get-ChildItem -LiteralPath $FilesDir -File -Recurse | ForEach-Object {
+        [PSCustomObject]@{
+            Path = $_.FullName.Substring($FilesDir.Length).TrimStart('\').Replace('\', '/')
+            Size = $_.Length
+            Hash = (Get-FileHash -LiteralPath $_.FullName -Algorithm SHA256).Hash
+        }
+    } | Sort-Object Path)
+    $FullManifestLines = [System.Collections.Generic.List[string]]::new()
+    $FullManifestLines.Add("`$VERSION = $BuildId")
+    $FullManifestLines.Add("`$NUM_ENTRIES = $($FullEntries.Count)")
+    foreach ($Entry in $FullEntries) {
+        $FullManifestLines.Add("$($Entry.Path)`t$($Entry.Size)`tSHA256:$($Entry.Hash)")
+    }
+    $FullManifestPath = Join-Path $VersionDir "FullManifest.txt"
+    [System.IO.File]::WriteAllLines($FullManifestPath, $FullManifestLines, [System.Text.UTF8Encoding]::new($false))
+
     $FullZip = Join-Path $FullDir "PatchGame.zip"
     if (Test-Path -LiteralPath $FullZip) { Remove-Item -LiteralPath $FullZip -Force }
 
@@ -239,10 +282,27 @@ if ($Full) {
 
     $FullHash = (Get-FileHash -LiteralPath $FullZip -Algorithm SHA256).Hash.ToLowerInvariant()
     [System.IO.File]::WriteAllText("$FullZip.sha256", $FullHash, [System.Text.UTF8Encoding]::new($false))
+    $ManifestPublicKey = ""
+    if ($SigningKey) {
+        $SigningKey = (Get-Item -LiteralPath $SigningKey -ErrorAction Stop).FullName
+        Write-RsaSignature $FullManifestPath $SigningKey
+        $Rsa = [System.Security.Cryptography.RSACryptoServiceProvider]::new()
+        try {
+            $Rsa.FromXmlString((Get-Content -LiteralPath $SigningKey -Raw))
+            $ManifestPublicKey = $Rsa.ToXmlString($false)
+        } finally {
+            $Rsa.PersistKeyInCsp = $false
+            $Rsa.Dispose()
+        }
+    }
+
+    # Publish the version pointer only after its immutable manifest and signature are ready.
+    $FullVersionPath = Join-Path $FullDir "FullVersion.txt"
     [System.IO.File]::WriteAllText(
-        (Join-Path $FullDir "FullVersion.txt"),
+        $FullVersionPath,
         $BuildId,
         [System.Text.UTF8Encoding]::new($false))
+    if ($SigningKey) { Write-RsaSignature $FullVersionPath $SigningKey }
 
     Copy-Item -LiteralPath $LauncherExe -Destination (Join-Path $FullDir "Launcher.exe") -Force
     $LauncherIni = Get-Content -LiteralPath (Join-Path $LauncherDir "Launcher.ini") -Raw
@@ -252,6 +312,9 @@ if ($Full) {
     $LauncherIni = if ($LauncherIni -match '(?im)^GameTitle\s*=') {
         $LauncherIni -replace '(?im)^GameTitle\s*=.*$', "GameTitle=$ProjectName"
     } else { $LauncherIni.TrimEnd() + "`r`nGameTitle=$ProjectName`r`n" }
+    $LauncherIni = if ($LauncherIni -match '(?im)^ManifestPublicKey\s*=') {
+        $LauncherIni -replace '(?im)^ManifestPublicKey\s*=.*$', "ManifestPublicKey=$ManifestPublicKey"
+    } else { $LauncherIni.TrimEnd() + "`r`nManifestPublicKey=$ManifestPublicKey`r`n" }
     [System.IO.File]::WriteAllText(
         (Join-Path $FullDir "Launcher.ini"),
         $LauncherIni,
@@ -262,4 +325,6 @@ if ($Full) {
     Write-Host "Game exe: $($Layout.GameExe)"
     Write-Host "SHA-256: $FullHash"
     Write-Host "FullVersion: $FullDir\FullVersion.txt = $BuildId"
+    Write-Host "File manifest: $FullManifestPath ($($FullEntries.Count) files)"
+    if ($SigningKey) { Write-Host "RSA signatures: enabled" }
 }

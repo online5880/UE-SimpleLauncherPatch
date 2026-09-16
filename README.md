@@ -18,7 +18,8 @@
   - 블루프린트 노드 하나로 버전 체크, 다운로드, 마운트, 진행률 계산 지원
 - 🛡️ **스팀 스타일 1-클릭 C# 단일 파일 런처:**
   - 외부 SDK/라이브러리 의존성 없는 단일 C# (`.NET 4.x`) 소스 (Windows 기본 `csc`로 1초 빌드)
-  - CDN 다운로드 무결성 SHA-256 검증 및 자동 롤백 (Move-first 원자적 교체)
+  - 변경된 파일만 받는 SHA-256 증분 업데이트, 중단 다운로드 이어받기 및 자동 롤백
+  - 런처 자체 업데이트와 선택적 RSA 매니페스트 서명 검증
   - 게임 실행 파일 유실 시 자동 복구 및 재설치 지원
 - ⚡ **1-Click 패치 & CDN 퍼블리시 자동화:**
   - PowerShell 스크립트 한 줄로 빌드/쿡/청크 패키징/매니페스트 생성 및 정적 CDN 폴더 배치
@@ -33,9 +34,11 @@
 [ 유저 실행: Launcher.exe ]
        │
        ▼
- 1단계: 전체 빌드 업데이트
-  ├─ CDN에서 FullVersion.txt 및 PatchGame.zip(.sha256) 확인
-  ├─ exe, DLL, 베이스 엔진 파일 교체 (Move-first 안전 교체)
+ 1단계: 파일 단위 증분 업데이트
+  ├─ 선택적으로 서명된 FullVersion.txt 및 FullManifest.txt 확인
+  ├─ 변경된 exe, DLL, 베이스 엔진 파일만 다운로드
+  ├─ 실패 시 이전 파일로 원자적 롤백
+  ├─ 필요하면 Launcher.exe 자체 교체 후 재시작
   └─ 게임 실행 (YourGame.exe)
        │
        ▼
@@ -69,6 +72,8 @@ SimpleLauncherPatch/
         ├── CreatePatchLabel.py         # Primary Asset Label 생성 도구 (에디터 Python)
         ├── DumpLabel.py                # 라벨 상태 검사 스크립트
         ├── Publish-Patch.ps1           # 1-Click 패치 쿡 및 CDN 배포 스크립트
+        ├── New-SigningKey.ps1          # 런처 매니페스트 RSA 키 생성
+        ├── Package-Release.ps1         # 플러그인/런처 배포 ZIP 생성
         ├── Serve-CDN.ps1               # 로컬 테스트용 경량 HTTP 서버
         └── Throttle-CDN.py             # 다운로드 속도 제한 테스트용 서버
 ```
@@ -145,6 +150,11 @@ Tools/Scripts/CreatePatchLabel.py
 # 전체 게임 ZIP과 프로젝트명/실행 파일이 반영된 런처까지 함께 배포
 .\Plugins\SimpleLauncherPatch\Tools\Scripts\Publish-Patch.ps1 -Full
 
+# RSA 서명까지 적용한 전체 배포
+.\Plugins\SimpleLauncherPatch\Tools\Scripts\Publish-Patch.ps1 `
+  -Full `
+  -SigningKey .\LauncherSigning.private.xml
+
 # 자동 감지가 불가능하거나 후보가 여러 개일 때만 직접 지정
 .\Plugins\SimpleLauncherPatch\Tools\Scripts\Publish-Patch.ps1 `
   -Project .\MyGame.uproject `
@@ -153,7 +163,7 @@ Tools/Scripts/CreatePatchLabel.py
   -Full
 ```
 
-결과물은 기본적으로 `Tools/Scripts/Cloud`에 생성됩니다. 경로를 바꾸려면 `-CloudRoot`를 사용하고, 이미 만들어진 스테이징 빌드를 재사용하려면 `-SkipBuild`를 사용합니다.
+결과물은 기본적으로 `Tools/Scripts/Cloud`에 생성됩니다. `Full/<BuildId>/Files`에는 버전별 전체 파일, `FullManifest.txt`에는 각 파일의 크기와 SHA-256이 기록됩니다. 이전 런처 마이그레이션용 `PatchGame.zip`도 함께 생성됩니다. 경로를 바꾸려면 `-CloudRoot`를 사용하고, 이미 만들어진 스테이징 빌드를 재사용하려면 `-SkipBuild`를 사용합니다.
 
 ---
 
@@ -164,6 +174,7 @@ Tools/Scripts/CreatePatchLabel.py
    CdnUrl=http://127.0.0.1:8080
    GameExe=YourGame.exe
    GameTitle=Your Game
+   ManifestPublicKey=
    ```
 2. `build.cmd`를 실행하면 별도 Visual Studio 설치 없이도 Windows 기본 `csc.exe`를 사용하여 `Launcher.exe`가 1초 만에 빌드됩니다:
    ```cmd
@@ -172,7 +183,17 @@ Tools/Scripts/CreatePatchLabel.py
    ```
 3. 생성된 `Launcher.exe`와 `Launcher.ini`를 유저에게 배포합니다.
 
-다운로드가 중단되면 설치 폴더의 `PatchGame_update.zip.part`를 보존합니다. 같은 업데이트를 다시 시도할 때 HTTP Range를 지원하는 CDN이면 받은 지점부터 이어받고, 지원하지 않는 서버면 자동으로 처음부터 다시 받습니다. 버전별 SHA-256이 달라지거나 파일이 손상되면 부분 파일을 폐기합니다.
+다운로드가 중단되면 `.launcher-cache/<BuildId>`에 파일별 `.part`를 보존합니다. 같은 업데이트를 다시 시도할 때 HTTP Range를 지원하는 CDN이면 받은 지점부터 이어받고, 지원하지 않는 서버면 자동으로 처음부터 다시 받습니다. 버전별 SHA-256이 달라지거나 파일이 손상되면 부분 파일을 폐기합니다.
+
+> 1.2 이하 런처에는 셀프 업데이트 코드가 없으므로 1.3 런처를 한 번 직접 배포해야 합니다. 이후 버전부터는 `Launcher.exe`도 매니페스트에 포함되어 자동 교체됩니다.
+
+프로덕션 배포에서는 먼저 키를 한 번 생성하고 개인 키를 안전한 별도 위치에 보관합니다:
+
+```powershell
+.\Tools\Scripts\New-SigningKey.ps1 -OutputDir C:\Secure\LauncherKeys
+```
+
+`Publish-Patch.ps1 -SigningKey`를 사용하면 `Launcher.ini`의 `ManifestPublicKey`가 자동으로 채워집니다. `*.private.xml`은 Git에서 제외되며 외부에 배포하면 안 됩니다.
 
 ### 5. 배포 ZIP 만들기
 

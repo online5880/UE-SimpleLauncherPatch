@@ -12,3 +12,4 @@ Tools/Launcher/Launcher.log
 Tools/Scripts/Cloud/
 __pycache__/
 *.pyc
+*.private.xml

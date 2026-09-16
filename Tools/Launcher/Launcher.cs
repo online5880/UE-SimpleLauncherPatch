@@ -31,6 +31,21 @@ static class Program
                 bool ok = LauncherForm.ComputeSha256(path) == hash &&
                     LauncherForm.PreparePartial(path, meta, hash, 3) == 3;
 
+                string manifest = "$VERSION = 1.2.3\n$NUM_ENTRIES = 1\n" +
+                    "Game.exe\t3\tSHA256:" + hash + "\n";
+                ok = ok && LauncherForm.ParseFullManifest(manifest, "1.2.3").Count == 1;
+
+                byte[] signedData = Encoding.UTF8.GetBytes("signed manifest");
+                using (var rsa = new RSACryptoServiceProvider(1024))
+                {
+                    rsa.PersistKeyInCsp = false;
+                    byte[] signature = rsa.SignData(signedData, CryptoConfig.MapNameToOID("SHA256"));
+                    string publicKey = rsa.ToXmlString(false);
+                    ok = ok && LauncherForm.VerifySignature(signedData, publicKey, signature);
+                    signedData[0] ^= 1;
+                    ok = ok && !LauncherForm.VerifySignature(signedData, publicKey, signature);
+                }
+
                 File.WriteAllText(meta, new string('0', 64));
                 ok = ok && LauncherForm.PreparePartial(path, meta, hash, 3) == 0 &&
                     !File.Exists(path);
@@ -45,8 +60,15 @@ static class Program
 
         Application.EnableVisualStyles();
         Application.SetCompatibleTextRenderingDefault(false);
-        Application.Run(new LauncherForm());
+        Application.Run(new LauncherForm(args.Length > 0 && args[0] == "--play"));
     }
+}
+
+class FullFileEntry
+{
+    public string Path;
+    public long Size;
+    public string Hash;
 }
 
 class LauncherForm : Form
@@ -69,6 +91,7 @@ class LauncherForm : Form
     string _cdnUrl = "http://127.0.0.1:8080";
     string _gameExe = "YourGame.exe";
     string _gameTitle = "GAME";
+    string _manifestPublicKey = "";
 
     readonly Label _badge;
     readonly Label _localVer;
@@ -87,6 +110,8 @@ class LauncherForm : Form
     long _lastProgressLogMs;
     bool _phaseDownloading;
     bool _busy;
+    bool _autoPlay;
+    bool _selfUpdateScheduled;
     string _currentVersion = "";
     string _latestVersion = "";
     string _dlFileName = "PatchGame.zip";
@@ -98,8 +123,9 @@ class LauncherForm : Form
     readonly Font _textFont = new Font("Segoe UI", 10.5f);
     readonly Font _playFont = new Font("Segoe UI", 20f, FontStyle.Bold);
 
-    public LauncherForm()
+    public LauncherForm(bool autoPlay = false)
     {
+        _autoPlay = autoPlay;
         _gameDir = AppDomain.CurrentDomain.BaseDirectory;
         _exeName = Path.GetFileName(Application.ExecutablePath);
         LoadConfig();
@@ -255,6 +281,7 @@ class LauncherForm : Form
             if (key.Equals("CdnUrl", StringComparison.OrdinalIgnoreCase)) _cdnUrl = val;
             else if (key.Equals("GameExe", StringComparison.OrdinalIgnoreCase)) _gameExe = val;
             else if (key.Equals("GameTitle", StringComparison.OrdinalIgnoreCase)) _gameTitle = val;
+            else if (key.Equals("ManifestPublicKey", StringComparison.OrdinalIgnoreCase)) _manifestPublicKey = val;
         }
     }
 
@@ -323,7 +350,7 @@ class LauncherForm : Form
             try
             {
                 remote = await Task.Run(() =>
-                    HttpGetString(_cdnUrl.TrimEnd('/') + "/Full/FullVersion.txt"));
+                    HttpGetVerifiedString(_cdnUrl.TrimEnd('/') + "/Full/FullVersion.txt"));
                 remote = remote.Trim();
                 if (remote.Length == 0) throw new Exception("CDN 버전이 비어 있습니다.");
                 _latestVersion = remote;
@@ -365,6 +392,11 @@ class LauncherForm : Form
         {
             _busy = false;
             _play.Enabled = true;
+            if (_autoPlay)
+            {
+                _autoPlay = false;
+                BeginInvoke(new Action(PlayClicked));
+            }
         }
     }
 
@@ -377,6 +409,12 @@ class LauncherForm : Form
         try
         {
             bool updateSucceeded = !UpdateAvailable() || await RunUpdate();
+
+            if (_selfUpdateScheduled)
+            {
+                Close();
+                return;
+            }
 
             if (!updateSucceeded && !File.Exists(Path.Combine(_gameDir, _gameExe)))
             {
@@ -406,12 +444,312 @@ class LauncherForm : Form
         string local = File.Exists(localVersionPath)
             ? File.ReadAllText(localVersionPath).Trim()
             : "";
-        return !string.IsNullOrEmpty(_latestVersion) &&
-            !string.Equals(local, _latestVersion, StringComparison.Ordinal);
+        if (!string.IsNullOrEmpty(_latestVersion) &&
+            !string.Equals(local, _latestVersion, StringComparison.Ordinal))
+            return true;
+
+        foreach (FullFileEntry entry in ReadLocalManifest())
+        {
+            if (IsLauncherEntry(entry))
+                return !File.Exists(Application.ExecutablePath) ||
+                    new FileInfo(Application.ExecutablePath).Length != entry.Size ||
+                    !string.Equals(ComputeSha256(Application.ExecutablePath), entry.Hash,
+                        StringComparison.OrdinalIgnoreCase);
+        }
+        return false;
     }
 
-    // full update pipeline: download (manual stream) -> extract -> move-first apply
     async Task<bool> RunUpdate()
+    {
+        string manifestUrl = _cdnUrl.TrimEnd('/') + "/Full/" +
+            Uri.EscapeDataString(_latestVersion) + "/FullManifest.txt";
+        bool useLegacy = false;
+        string manifest = null;
+        try
+        {
+            manifest = await Task.Run(() => HttpGetVerifiedString(manifestUrl));
+        }
+        catch (WebException ex)
+        {
+            var response = ex.Response as HttpWebResponse;
+            if (!string.IsNullOrEmpty(_manifestPublicKey) ||
+                response == null || response.StatusCode != HttpStatusCode.NotFound)
+                return ReportUpdateFailure(ex, "manifest download failed");
+            Log("file manifest not found; using legacy ZIP update");
+            useLegacy = true;
+        }
+        catch (Exception ex)
+        {
+            return ReportUpdateFailure(ex, "manifest verification failed");
+        }
+        return useLegacy ? await RunLegacyUpdate() : await RunIncrementalUpdate(manifest, manifestUrl);
+    }
+
+    async Task<bool> RunIncrementalUpdate(string manifestText, string manifestUrl)
+    {
+        string cacheRoot = Path.Combine(_gameDir, ".launcher-cache", _latestVersion);
+        try
+        {
+            List<FullFileEntry> entries = ParseFullManifest(manifestText, _latestVersion);
+            _status.Text = "설치 파일 검사 중...";
+            List<FullFileEntry> changed = await Task.Run(() => FindChangedFiles(entries));
+            List<FullFileEntry> previous = ReadLocalManifest();
+            var currentPaths = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+            foreach (FullFileEntry entry in entries) currentPaths.Add(entry.Path);
+            var obsolete = new List<FullFileEntry>();
+            foreach (FullFileEntry entry in previous)
+                if (!currentPaths.Contains(entry.Path) && !IsLauncherEntry(entry)) obsolete.Add(entry);
+
+            long totalBytes = 0;
+            foreach (FullFileEntry entry in changed) totalBytes += entry.Size;
+            long completedBytes = 0;
+            if (changed.Count > 0)
+            {
+                _progress.Visible = true;
+                _progressText.Visible = true;
+                _phaseDownloading = true;
+                _samples.Clear();
+                _lastProgressLogMs = 0;
+                _sw.Restart();
+            }
+
+            foreach (FullFileEntry entry in changed)
+            {
+                _dlFileName = entry.Path;
+                string partial = SafePath(cacheRoot, entry.Path + ".part");
+                Directory.CreateDirectory(Path.GetDirectoryName(partial));
+                string partialHash = partial + ".sha256";
+                long offset = PreparePartial(partial, partialHash, entry.Hash, entry.Size);
+                lock (_dlLock)
+                {
+                    _bytesReceived = completedBytes + offset;
+                    _totalBytes = totalBytes;
+                }
+                _status.Text = offset > 0 ? "변경 파일 이어받는 중..." : "변경 파일 다운로드 중...";
+                string fileUrl = manifestUrl.Substring(0, manifestUrl.LastIndexOf('/') + 1) +
+                    "Files/" + EscapeUrlPath(entry.Path);
+                Log(string.Format("file download: {0}, size={1}, resume={2}", entry.Path, entry.Size, offset));
+                await Task.Run(() => DownloadStream(fileUrl, partial, entry.Size, completedBytes, totalBytes));
+
+                string actualHash = await Task.Run(() => ComputeSha256(partial));
+                if (!string.Equals(actualHash, entry.Hash, StringComparison.OrdinalIgnoreCase))
+                {
+                    DeletePartial(partial, partialHash);
+                    throw new Exception("파일 SHA-256 검증 실패: " + entry.Path);
+                }
+                completedBytes += entry.Size;
+            }
+            _phaseDownloading = false;
+
+            _status.Text = "업데이트 적용 중...";
+            await Task.Run(() => ApplyIncremental(changed, obsolete, cacheRoot));
+            File.WriteAllText(Path.Combine(_gameDir, "FullManifest.txt"), manifestText, new UTF8Encoding(false));
+            File.WriteAllText(Path.Combine(_gameDir, "FullVersion.txt"), _latestVersion, new UTF8Encoding(false));
+            _currentVersion = _latestVersion;
+            UpdateVersionLabels();
+
+            FullFileEntry launcher = changed.Find(IsLauncherEntry);
+            if (launcher != null)
+            {
+                string newLauncher = SafePath(cacheRoot, launcher.Path + ".part");
+                ScheduleSelfUpdate(newLauncher, cacheRoot);
+                _status.Text = "런처 업데이트 후 다시 시작합니다...";
+                _selfUpdateScheduled = true;
+            }
+            else
+            {
+                try { if (Directory.Exists(cacheRoot)) Directory.Delete(cacheRoot, true); } catch { }
+                _status.Text = changed.Count == 0 && obsolete.Count == 0
+                    ? "최신 버전입니다"
+                    : "업데이트 완료";
+            }
+
+            Log(string.Format("incremental update applied: {0}, changed={1}, removed={2}",
+                _latestVersion, changed.Count, obsolete.Count));
+            return true;
+        }
+        catch (Exception ex)
+        {
+            _phaseDownloading = false;
+            return ReportUpdateFailure(ex, "incremental update failed");
+        }
+        finally
+        {
+            _progress.Visible = false;
+            _progressText.Visible = false;
+        }
+    }
+
+    List<FullFileEntry> FindChangedFiles(List<FullFileEntry> entries)
+    {
+        var changed = new List<FullFileEntry>();
+        foreach (FullFileEntry entry in entries)
+        {
+            string path = IsLauncherEntry(entry) ? Application.ExecutablePath : SafePath(_gameDir, entry.Path);
+            if (!File.Exists(path) || new FileInfo(path).Length != entry.Size ||
+                !string.Equals(ComputeSha256(path), entry.Hash, StringComparison.OrdinalIgnoreCase))
+                changed.Add(entry);
+        }
+        return changed;
+    }
+
+    List<FullFileEntry> ReadLocalManifest()
+    {
+        string path = Path.Combine(_gameDir, "FullManifest.txt");
+        if (!File.Exists(path)) return new List<FullFileEntry>();
+        try { return ParseFullManifest(File.ReadAllText(path), ""); }
+        catch { return new List<FullFileEntry>(); }
+    }
+
+    internal static List<FullFileEntry> ParseFullManifest(string text, string expectedVersion)
+    {
+        var entries = new List<FullFileEntry>();
+        var paths = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        string version = "";
+        int expectedCount = -1;
+        foreach (string raw in text.Replace("\r", "").Split('\n'))
+        {
+            string line = raw.Trim();
+            if (line.Length == 0) continue;
+            if (line.StartsWith("$VERSION = "))
+            {
+                version = line.Substring(11).Trim();
+                continue;
+            }
+            if (line.StartsWith("$NUM_ENTRIES = "))
+            {
+                if (!int.TryParse(line.Substring(15).Trim(), out expectedCount) || expectedCount < 0)
+                    throw new Exception("전체 빌드 매니페스트 파일 수가 올바르지 않습니다.");
+                continue;
+            }
+
+            string[] fields = line.Split('\t');
+            long size;
+            if (fields.Length != 3 || !long.TryParse(fields[1], out size) || size < 0 ||
+                !fields[2].StartsWith("SHA256:", StringComparison.OrdinalIgnoreCase))
+                throw new Exception("전체 빌드 매니페스트 형식이 올바르지 않습니다.");
+            string path = fields[0].Replace('\\', '/');
+            string hash = fields[2].Substring(7);
+            if (path.Length == 0 || Path.IsPathRooted(path) || path.Contains("../") ||
+                !IsSha256(hash) || !paths.Add(path))
+                throw new Exception("전체 빌드 매니페스트 항목이 올바르지 않습니다: " + path);
+            entries.Add(new FullFileEntry { Path = path, Size = size, Hash = hash });
+        }
+        if (version.Length == 0 ||
+            (expectedVersion.Length > 0 && !string.Equals(version, expectedVersion, StringComparison.Ordinal)))
+            throw new Exception("전체 빌드 매니페스트 버전이 일치하지 않습니다.");
+        if (expectedCount != entries.Count)
+            throw new Exception("전체 빌드 매니페스트 파일 수가 일치하지 않습니다.");
+        return entries;
+    }
+
+    void ApplyIncremental(List<FullFileEntry> changed, List<FullFileEntry> obsolete, string cacheRoot)
+    {
+        StopRunningGame();
+        string backupRoot = Path.Combine(_gameDir, "__patch_backup");
+        if (Directory.Exists(backupRoot)) Directory.Delete(backupRoot, true);
+        Directory.CreateDirectory(backupRoot);
+        var touched = new List<string>();
+        try
+        {
+            foreach (FullFileEntry entry in obsolete)
+                BackupCurrentFile(entry.Path, backupRoot, touched);
+
+            foreach (FullFileEntry entry in changed)
+            {
+                if (IsLauncherEntry(entry)) continue;
+                BackupCurrentFile(entry.Path, backupRoot, touched);
+                string source = SafePath(cacheRoot, entry.Path + ".part");
+                string dest = SafePath(_gameDir, entry.Path);
+                Directory.CreateDirectory(Path.GetDirectoryName(dest));
+                File.Move(source, dest);
+            }
+        }
+        catch
+        {
+            for (int i = touched.Count - 1; i >= 0; --i)
+            {
+                string dest = SafePath(_gameDir, touched[i]);
+                string backup = SafePath(backupRoot, touched[i]);
+                try { if (File.Exists(dest)) File.Delete(dest); } catch { }
+                if (File.Exists(backup))
+                {
+                    Directory.CreateDirectory(Path.GetDirectoryName(dest));
+                    try { File.Move(backup, dest); } catch { }
+                }
+            }
+            try { Directory.Delete(backupRoot, true); } catch { }
+            throw;
+        }
+        try { Directory.Delete(backupRoot, true); } catch { }
+    }
+
+    void BackupCurrentFile(string relativePath, string backupRoot, List<string> touched)
+    {
+        string dest = SafePath(_gameDir, relativePath);
+        string backup = SafePath(backupRoot, relativePath);
+        if (Directory.Exists(dest))
+            throw new Exception("파일 경로가 디렉터리와 충돌합니다: " + relativePath);
+        if (File.Exists(dest))
+        {
+            Directory.CreateDirectory(Path.GetDirectoryName(backup));
+            File.Move(dest, backup);
+        }
+        touched.Add(relativePath);
+    }
+
+    void ScheduleSelfUpdate(string newLauncher, string cacheRoot)
+    {
+        string script = Path.Combine(_gameDir, "LauncherUpdate.cmd");
+        string current = Application.ExecutablePath;
+        int pid = Process.GetCurrentProcess().Id;
+        string body = "@echo off\r\nsetlocal\r\n:wait\r\n" +
+            "tasklist /FI \"PID eq " + pid + "\" 2>NUL | find \"" + pid + "\" >NUL\r\n" +
+            "if not errorlevel 1 (timeout /t 1 /nobreak >NUL & goto wait)\r\n" +
+            "move /Y \"" + BatchPath(newLauncher) + "\" \"" + BatchPath(current) + "\" >NUL\r\n" +
+            "if errorlevel 1 exit /b 1\r\n" +
+            "rmdir /S /Q \"" + BatchPath(cacheRoot) + "\" 2>NUL\r\n" +
+            "start \"\" \"" + BatchPath(current) + "\" --play\r\n" +
+            "del \"%~f0\"\r\n";
+        File.WriteAllText(script, body, Encoding.Default);
+        Process.Start(new ProcessStartInfo
+        {
+            FileName = "cmd.exe",
+            Arguments = "/d /c call \"" + script + "\"",
+            CreateNoWindow = true,
+            UseShellExecute = false,
+            WorkingDirectory = _gameDir
+        });
+    }
+
+    static string SafePath(string root, string relativePath)
+    {
+        string fullRoot = Path.GetFullPath(root).TrimEnd(Path.DirectorySeparatorChar) + Path.DirectorySeparatorChar;
+        string full = Path.GetFullPath(Path.Combine(fullRoot, relativePath.Replace('/', Path.DirectorySeparatorChar)));
+        if (!full.StartsWith(fullRoot, StringComparison.OrdinalIgnoreCase))
+            throw new Exception("비정상적인 업데이트 경로: " + relativePath);
+        return full;
+    }
+
+    static string EscapeUrlPath(string path)
+    {
+        string[] parts = path.Replace('\\', '/').Split('/');
+        for (int i = 0; i < parts.Length; ++i) parts[i] = Uri.EscapeDataString(parts[i]);
+        return string.Join("/", parts);
+    }
+
+    bool IsLauncherEntry(FullFileEntry entry)
+    {
+        return string.Equals(entry.Path, "Launcher.exe", StringComparison.OrdinalIgnoreCase);
+    }
+
+    static string BatchPath(string path)
+    {
+        return path.Replace("%", "%%");
+    }
+
+    // Legacy full ZIP fallback for CDN deployments created before version 1.3.
+    async Task<bool> RunLegacyUpdate()
     {
         string zipUrl = _cdnUrl.TrimEnd('/') + "/Full/PatchGame.zip";
         _dlFileName = Path.GetFileName(new Uri(zipUrl).LocalPath);
@@ -479,13 +817,7 @@ class LauncherForm : Form
         catch (Exception ex)
         {
             _phaseDownloading = false;
-            Log("update failed: " + ex);
-            bool installed = File.Exists(Path.Combine(_gameDir, _gameExe));
-            _status.Text = installed ? "업데이트 실패 — 기존 버전을 실행합니다" : "설치 실패 — 다시 시도해 주세요";
-            MessageBox.Show(ex.Message + "\n\n가능한 경우 이어받기 파일을 다음 시도를 위해 보존합니다.\n상세 로그: " +
-                Path.Combine(_gameDir, "Launcher.log"), "업데이트 실패",
-                MessageBoxButtons.OK, MessageBoxIcon.Error);
-            return false;
+            return ReportUpdateFailure(ex, "legacy update failed");
         }
         finally
         {
@@ -493,6 +825,17 @@ class LauncherForm : Form
             _progress.Visible = false;
             _progressText.Visible = false;
         }
+    }
+
+    bool ReportUpdateFailure(Exception ex, string logPrefix)
+    {
+        Log(logPrefix + ": " + ex);
+        bool installed = File.Exists(Path.Combine(_gameDir, _gameExe));
+        _status.Text = installed ? "업데이트 실패 — 기존 버전을 실행합니다" : "설치 실패 — 다시 시도해 주세요";
+        MessageBox.Show(ex.Message + "\n\n가능한 경우 이어받기 파일을 다음 시도를 위해 보존합니다.\n상세 로그: " +
+            Path.Combine(_gameDir, "Launcher.log"), "업데이트 실패",
+            MessageBoxButtons.OK, MessageBoxIcon.Error);
+        return false;
     }
 
     static long GetContentLength(string url)
@@ -506,6 +849,11 @@ class LauncherForm : Form
 
     // Continue a partial file with HTTP Range. Servers that ignore Range safely restart at byte 0.
     void DownloadStream(string url, string destPath, long expectedSize)
+    {
+        DownloadStream(url, destPath, expectedSize, 0, expectedSize);
+    }
+
+    void DownloadStream(string url, string destPath, long expectedSize, long completedBytes, long totalBytes)
     {
         long offset = File.Exists(destPath) ? new FileInfo(destPath).Length : 0;
         if (expectedSize >= 0 && offset == expectedSize) return;
@@ -527,8 +875,8 @@ class LauncherForm : Form
 
             lock (_dlLock)
             {
-                _bytesReceived = offset;
-                _totalBytes = expectedSize > 0 ? expectedSize : offset + Math.Max(0, resp.ContentLength);
+                _bytesReceived = completedBytes + offset;
+                _totalBytes = totalBytes > 0 ? totalBytes : completedBytes + offset + Math.Max(0, resp.ContentLength);
             }
 
             using (Stream input = resp.GetResponseStream())
@@ -578,14 +926,50 @@ class LauncherForm : Form
     }
 
     // small GET for the version file; returns raw UTF-8 text
-    static string HttpGetString(string url)
+    string HttpGetVerifiedString(string url)
+    {
+        byte[] data = HttpGetBytes(url);
+        if (!string.IsNullOrEmpty(_manifestPublicKey))
+        {
+            string encodedSignature = Encoding.UTF8.GetString(HttpGetBytes(url + ".sig")).Trim();
+            byte[] signature;
+            try { signature = Convert.FromBase64String(encodedSignature); }
+            catch { throw new Exception("업데이트 서명 형식이 올바르지 않습니다: " + url); }
+
+            if (!VerifySignature(data, _manifestPublicKey, signature))
+                throw new Exception("업데이트 서명 검증에 실패했습니다: " + url);
+        }
+        return Encoding.UTF8.GetString(data).TrimStart('\uFEFF');
+    }
+
+    internal static bool VerifySignature(byte[] data, string publicKey, byte[] signature)
+    {
+        using (var rsa = new RSACryptoServiceProvider())
+        {
+            rsa.PersistKeyInCsp = false;
+            try { rsa.FromXmlString(publicKey); }
+            catch { throw new Exception("Launcher.ini 공개 키 형식이 올바르지 않습니다."); }
+            return rsa.VerifyData(data, CryptoConfig.MapNameToOID("SHA256"), signature);
+        }
+    }
+
+    static byte[] HttpGetBytes(string url)
     {
         var req = (HttpWebRequest)WebRequest.Create(url);
         req.Method = "GET";
         req.Timeout = HttpTimeoutMs;
         using (var resp = (HttpWebResponse)req.GetResponse())
-        using (var reader = new StreamReader(resp.GetResponseStream(), Encoding.UTF8))
-            return reader.ReadToEnd();
+        using (Stream input = resp.GetResponseStream())
+        using (var output = new MemoryStream())
+        {
+            input.CopyTo(output);
+            return output.ToArray();
+        }
+    }
+
+    static string HttpGetString(string url)
+    {
+        return Encoding.UTF8.GetString(HttpGetBytes(url)).TrimStart('\uFEFF');
     }
 
     internal static string ComputeSha256(string path)
@@ -640,19 +1024,7 @@ class LauncherForm : Form
         string oldDir = Path.Combine(_gameDir, "__old");
         var movedIn = new List<string>();
 
-        // kill any running game so the update can replace locked files
-        try
-        {
-            Process.Start(new ProcessStartInfo
-            {
-                FileName = "taskkill",
-                Arguments = "/IM " + _gameExe + " /F",
-                CreateNoWindow = true,
-                UseShellExecute = false
-            });
-        }
-        catch { }
-        System.Threading.Thread.Sleep(1500); // give the OS time to release handles
+        StopRunningGame();
 
         try
         {
@@ -690,6 +1062,22 @@ class LauncherForm : Form
 
         // success: drop the old copy; leftovers that won't delete are manual cleanup
         try { if (Directory.Exists(oldDir)) Directory.Delete(oldDir, true); } catch { }
+    }
+
+    void StopRunningGame()
+    {
+        try
+        {
+            Process.Start(new ProcessStartInfo
+            {
+                FileName = "taskkill",
+                Arguments = "/IM " + _gameExe + " /F",
+                CreateNoWindow = true,
+                UseShellExecute = false
+            });
+        }
+        catch { }
+        System.Threading.Thread.Sleep(1500); // give the OS time to release handles
     }
 
     // best-effort restore on mid-swap failure: pull newly installed items back out,
