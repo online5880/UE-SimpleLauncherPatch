@@ -95,8 +95,13 @@ SimpleLauncherPatch/
    ```ini
    [/Script/Plugins.ChunkDownloader PatchGameLive]
    +CdnBaseUrls="http://127.0.0.1:8080"
+
+   [/Script/UnrealEd.ProjectPackagingSettings]
+   bUseIoStore=False
    ```
    > ⚠️ **주의**: URL은 반드시 큰따옴표(`""`)로 감싸야 합니다. 그렇지 않으면 언리얼 엔진 ini 파서가 `//`를 주석으로 인식하여 주소가 잘립니다.
+
+   런타임 Pak 마운트를 사용하므로 패키징의 **Use Io Store**는 꺼야 합니다.
 
 ---
 
@@ -106,8 +111,16 @@ SimpleLauncherPatch/
 
 - **Get Patch Subsystem**: 서브시스템 인스턴스 가져오기
 - **Start Patch**: 최신 CDN 매니페스트 확인 후 패치 다운로드 및 마운트 시작
+- **Retry Patch**: 최종 실패 또는 자동 재시도 대기 중 즉시 다시 시도
 - **Get Patch Progress**: 패치 진행률 (0.0 ~ 1.0)
+- **Get Patch State**: 버전 확인, 재시도 대기, 다운로드, 마운트, 완료, 실패 상태
+- **Get Last Patch Error / Get Retry Attempt**: 마지막 실패 원인과 현재 재시도 횟수
 - **On Patch Complete**: 패치 완료(성공/실패) 이벤트 바인딩
+- **On Patch State Changed**: 상태와 오류가 변경될 때 이벤트 수신
+
+`Live.txt` 요청은 네트워크가 복구될 때까지 5초부터 최대 60초 간격으로 자동 재시도합니다. 종료 시 진행 중인 HTTP 요청과 타이머를 취소하고 `ChunkDownloader` 캐시를 안전하게 닫습니다.
+
+> UE 5.6 Windows 기본 `ChunkDownloader`는 완료된 Pak 단위로 복구합니다. 게임이 종료될 때 이미 완료된 Pak은 다음 실행에서 재사용하지만, 당시 다운로드 중이던 Pak 하나는 처음부터 다시 받습니다.
 
 ---
 
