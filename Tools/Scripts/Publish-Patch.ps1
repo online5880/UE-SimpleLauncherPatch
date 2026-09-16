@@ -242,7 +242,8 @@ Write-Host "Published $($Entries.Count) file(s), Live.txt = $BuildId ($Header)"
 if ($Full) {
     $LauncherDir = Join-Path (Split-Path -Parent $PSScriptRoot) "Launcher"
     $LauncherExe = Join-Path $LauncherDir "Launcher.exe"
-    if (-not (Test-Path -LiteralPath $LauncherExe -PathType Leaf)) {
+    if (-not (Test-Path -LiteralPath $LauncherExe -PathType Leaf) -or
+        (Get-Item (Join-Path $LauncherDir "Launcher.cs")).LastWriteTimeUtc -gt (Get-Item $LauncherExe).LastWriteTimeUtc) {
         & (Join-Path $LauncherDir "build.cmd")
         if ($LASTEXITCODE -ne 0) { throw "Launcher build failed with exit code $LASTEXITCODE" }
     }
@@ -300,6 +301,43 @@ if ($Full) {
     }
     $FullManifestPath = Join-Path $VersionDir "FullManifest.txt"
     [System.IO.File]::WriteAllLines($FullManifestPath, $FullManifestLines, [System.Text.UTF8Encoding]::new($false))
+
+    # ponytail: fixed offsets reuse aligned blocks; use content-defined chunks if cooked offsets shift heavily.
+    $BlockMaps = Join-Path $VersionDir "Blocks"
+    foreach ($Entry in $FullEntries | Where-Object { $_.Size -gt 4MB -and $_.Path -match '\.(pak|ucas)$' }) {
+        New-Item -ItemType Directory -Force -Path $BlockMaps | Out-Null
+        $BlockLines = [System.Collections.Generic.List[string]]::new()
+        $BlockLines.Add("`$VERSION = $($Entry.Hash)")
+        $BlockLines.Add("`$NUM_ENTRIES = $([long][Math]::Ceiling($Entry.Size / 4MB))")
+        $InputStream = [IO.File]::OpenRead($Entry.Source)
+        $Buffer = [byte[]]::new(4MB)
+        $Index = 0
+        try {
+            while ($InputStream.Position -lt $InputStream.Length) {
+                $Count = 0
+                while ($Count -lt $Buffer.Length) {
+                    $Read = $InputStream.Read($Buffer, $Count, $Buffer.Length - $Count)
+                    if ($Read -eq 0) { break }
+                    $Count += $Read
+                }
+                $Sha = [Security.Cryptography.SHA256]::Create()
+                try { $Hash = [Convert]::ToHexString($Sha.ComputeHash($Buffer, 0, $Count)) } finally { $Sha.Dispose() }
+                $BlockDir = Join-Path $ObjectsDir $Hash.Substring(0, 2).ToLowerInvariant()
+                $BlockPath = Join-Path $BlockDir $Hash.ToLowerInvariant()
+                New-Item -ItemType Directory -Force -Path $BlockDir | Out-Null
+                if (-not (Test-Path -LiteralPath $BlockPath) -or (Get-FileHash -LiteralPath $BlockPath).Hash -ne $Hash) {
+                    $OutputStream = [IO.File]::Create($BlockPath)
+                    try { $OutputStream.Write($Buffer, 0, $Count) } finally { $OutputStream.Dispose() }
+                }
+                $BlockLines.Add("$Index`t$Count`tSHA256:$Hash")
+                $Index++
+            }
+        } finally { $InputStream.Dispose() }
+        if ((Get-FileHash -LiteralPath $Entry.Source).Hash -ne $Entry.Hash) { throw "Staged file changed during block publishing: $($Entry.Path)" }
+        $BlockMap = Join-Path $BlockMaps "$($Entry.Hash.ToLowerInvariant()).txt"
+        [IO.File]::WriteAllLines($BlockMap, $BlockLines, [Text.UTF8Encoding]::new($false))
+        if ($SigningKey) { Write-RsaSignature $BlockMap $SigningKey }
+    }
 
     if ($LegacyFiles) {
         $FilesDir = Join-Path $VersionDir "Files"
@@ -367,6 +405,18 @@ if ($Full) {
         }
         if ($ExpectedEntries -lt 0 -or $FoundEntries -ne $ExpectedEntries) {
             throw "Cannot safely clean objects because a retained manifest is invalid: $RetainedManifest"
+        }
+        $RetainedBlocks = Join-Path $Retained.FullName "Blocks"
+        if (Test-Path -LiteralPath $RetainedBlocks) {
+            foreach ($Map in Get-ChildItem -LiteralPath $RetainedBlocks -Filter *.txt -File) {
+                $MapLines = @(Get-Content -LiteralPath $Map.FullName)
+                if ($MapLines.Count -lt 3 -or $MapLines[1] -notmatch '^\$NUM_ENTRIES = (\d+)$') { throw "Invalid block map: $($Map.FullName)" }
+                if ([long]$Matches[1] -ne $MapLines.Count - 2) { throw "Incomplete block map: $($Map.FullName)" }
+                foreach ($Line in $MapLines | Select-Object -Skip 2) {
+                    if ($Line -notmatch '^\d+\t[1-9]\d*\tSHA256:([A-Fa-f0-9]{64})$') { throw "Invalid block entry: $($Map.FullName)" }
+                    $null = $ReferencedObjects.Add($Matches[1])
+                }
+            }
         }
     }
     foreach ($OldVersion in @($VersionDirs | Select-Object -Skip $KeepFullVersions)) {

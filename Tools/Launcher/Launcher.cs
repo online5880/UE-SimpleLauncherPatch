@@ -531,7 +531,10 @@ class LauncherForm : Form
                 string legacyUrl = manifestUrl.Substring(0, manifestUrl.LastIndexOf('/') + 1) +
                     "Files/" + EscapeUrlPath(entry.Path);
                 Log(string.Format("file download: {0}, size={1}, resume={2}", entry.Path, entry.Size, offset));
-                await Task.Run(() => DownloadObject(objectUrl, legacyUrl, partial, entry.Size, completedBytes, totalBytes));
+                await Task.Run(() => {
+                    if (!DownloadBlocks(entry, manifestUrl, partial, completedBytes, totalBytes))
+                        DownloadObject(objectUrl, legacyUrl, partial, entry.Size, completedBytes, totalBytes);
+                });
 
                 string actualHash = await Task.Run(() => ComputeSha256(partial));
                 if (!string.Equals(actualHash, entry.Hash, StringComparison.OrdinalIgnoreCase))
@@ -853,6 +856,120 @@ class LauncherForm : Form
     void DownloadStream(string url, string destPath, long expectedSize)
     {
         DownloadStream(url, destPath, expectedSize, 0, expectedSize);
+    }
+
+    internal const int BlockSize = 4 * 1024 * 1024;
+
+    internal static List<FullFileEntry> ParseBlockMap(string text, FullFileEntry file)
+    {
+        var blocks = ParseFullManifest(text, file.Hash);
+        if (blocks.Count != (file.Size / BlockSize + (file.Size % BlockSize == 0 ? 0 : 1)))
+            throw new Exception("블록 수가 파일 크기와 일치하지 않습니다.");
+        long offset = 0;
+        for (int i = 0; i < blocks.Count; ++i)
+        {
+            if (blocks[i].Path != i.ToString(System.Globalization.CultureInfo.InvariantCulture) ||
+                blocks[i].Size != Math.Min(BlockSize, file.Size - offset))
+                throw new Exception("블록 순서 또는 크기가 올바르지 않습니다.");
+            offset += blocks[i].Size;
+        }
+        return blocks;
+    }
+
+    internal static bool ReadVerifiedBlock(Stream input, long offset, byte[] buffer, int count, string hash)
+    {
+        if (input == null || input.Length - offset < count) return false;
+        input.Position = offset;
+        int read = 0;
+        while (read < count)
+        {
+            int n = input.Read(buffer, read, count - read);
+            if (n == 0) return false;
+            read += n;
+        }
+        using (var sha = SHA256.Create())
+            return string.Equals(BitConverter.ToString(sha.ComputeHash(buffer, 0, count)).Replace("-", ""),
+                hash, StringComparison.OrdinalIgnoreCase);
+    }
+
+    // ponytail: reuse at fixed offsets; content-defined chunks can improve reuse when cooked data shifts.
+    internal static long AssembleBlocks(string local, string partial, FullFileEntry file,
+        List<FullFileEntry> blocks, Action<FullFileEntry, string, long> download, Action<long> progress)
+    {
+        long offset = 0, downloaded = 0;
+        byte[] buffer = new byte[BlockSize];
+        using (var input = File.Exists(local) ? File.OpenRead(local) : null)
+        using (var output = new FileStream(partial, FileMode.OpenOrCreate, FileAccess.ReadWrite, FileShare.None))
+        {
+            foreach (var block in blocks)
+            {
+                int count = (int)block.Size;
+                if (!ReadVerifiedBlock(output, offset, buffer, count, block.Hash))
+                {
+                    if (!ReadVerifiedBlock(input, offset, buffer, count, block.Hash))
+                    {
+                        string cached = partial + ".block";
+                        PreparePartial(cached, cached + ".sha256", block.Hash, block.Size);
+                        download(block, cached, offset);
+                        using (var received = File.OpenRead(cached))
+                        {
+                            if (received.Length != count || !ReadVerifiedBlock(received, 0, buffer, count, block.Hash))
+                            {
+                                // Close before removing the failed download on Windows.
+                                received.Close();
+                                DeletePartial(cached, cached + ".sha256");
+                                throw new Exception("블록 SHA-256 검증 실패: " + file.Path);
+                            }
+                        }
+                        downloaded += count;
+                        DeletePartial(cached, cached + ".sha256");
+                    }
+                    output.Position = offset;
+                    output.Write(buffer, 0, count);
+                }
+                offset += count;
+                progress(offset);
+            }
+            output.SetLength(file.Size);
+        }
+        if (!string.Equals(ComputeSha256(partial), file.Hash, StringComparison.OrdinalIgnoreCase))
+        {
+            DeletePartial(partial, partial + ".sha256");
+            throw new Exception("블록 조립 후 파일 SHA-256 검증 실패: " + file.Path);
+        }
+        return downloaded;
+    }
+
+    bool DownloadBlocks(FullFileEntry file, string manifestUrl, string partial, long completed, long total)
+    {
+        string extension = Path.GetExtension(file.Path);
+        if (file.Size <= BlockSize ||
+            !(string.Equals(extension, ".pak", StringComparison.OrdinalIgnoreCase) ||
+              string.Equals(extension, ".ucas", StringComparison.OrdinalIgnoreCase))) return false;
+        string mapUrl = manifestUrl.Substring(0, manifestUrl.LastIndexOf('/') + 1) +
+            "Blocks/" + file.Hash.ToLowerInvariant() + ".txt";
+        string text;
+        // Only an absent map falls back. Missing signatures and invalid metadata must fail closed.
+        try { text = HttpGetString(mapUrl); }
+        catch (WebException ex)
+        {
+            var response = ex.Response as HttpWebResponse;
+            if (response == null || response.StatusCode != HttpStatusCode.NotFound) throw;
+            response.Close();
+            return false;
+        }
+        if (!string.IsNullOrEmpty(_manifestPublicKey)) text = HttpGetVerifiedString(mapUrl);
+        var blocks = ParseBlockMap(text, file);
+        long downloaded = AssembleBlocks(SafePath(_gameDir, file.Path), partial, file, blocks,
+            (block, cache, offset) => {
+                string url = _cdnUrl.TrimEnd('/') + "/Full/Objects/" +
+                    block.Hash.Substring(0, 2).ToLowerInvariant() + "/" + block.Hash.ToLowerInvariant();
+                DownloadStream(url, cache, block.Size, completed + offset, total);
+            },
+            offset => { lock (_dlLock) { _bytesReceived = completed + offset; _totalBytes = total; } });
+        Log(string.Format("block update: {0}, downloaded={1}, reused={2}",
+            file.Path, downloaded, file.Size - downloaded));
+        return true;
     }
 
     void DownloadObject(string objectUrl, string legacyUrl, string destPath, long expectedSize,
