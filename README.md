@@ -216,14 +216,18 @@ Tools/Scripts/CreatePatchLabel.py
 
 ## 🛠️ 로컬 테스트 환경 구성
 
-CDN 서버가 없어도 로컬에서 완전한 엔드투엔드 테스트를 진행할 수 있습니다:
+프로젝트의 `Plugins/SimpleLauncherPatch/Tools/Scripts/Test-Local.cmd`를 더블클릭하면 끝입니다. 프로젝트·UE·게임 실행 파일을 자동 감지하고 다음 작업을 한 번에 수행합니다.
+
+```text
+게임 빌드 → 패치 배포 → 로컬 CDN 실행 → 테스트 런처 실행
+```
+
+첫 실행에서 `PLAY`를 눌러 전체 설치를 확인하고, 에셋을 수정한 뒤 `Test-Local.cmd`를 다시 실행하면 증분 패치를 확인할 수 있습니다. 테스트 파일은 프로젝트의 `Saved/SimpleLauncherPatchTest`에만 생성됩니다.
+
+서버만 따로 실행하려면 다음 명령을 사용합니다:
 
 ```powershell
-# 1. 로컬 정적 CDN 서버 실행 (포트 8080)
 .\Tools\Scripts\Serve-CDN.ps1
-
-# 2. 대역폭 제한(다운로드 속도 시뮬레이션) 테스트 서버 실행 (옵션)
-python .\Tools\Scripts\Throttle-CDN.py 2.5
 ```
 
 ---
