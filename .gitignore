@@ -1,0 +1,14 @@
+Binaries/
+Intermediate/
+DerivedDataCache/
+Saved/
+.vs/
+*.sln
+
+Tools/Launcher/bin/
+Tools/Launcher/obj/
+Tools/Launcher/Launcher.exe
+Tools/Launcher/Launcher.log
+Tools/Scripts/Cloud/
+__pycache__/
+*.pyc
