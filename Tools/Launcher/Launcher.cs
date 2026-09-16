@@ -19,14 +19,24 @@ static class Program
     {
         if (args.Length > 0 && args[0] == "--self-test")
         {
-            string path = Path.GetTempFileName();
+            string dir = Path.Combine(Path.GetTempPath(), "LauncherSelfTest_" + Guid.NewGuid().ToString("N"));
+            Directory.CreateDirectory(dir);
+            string path = Path.Combine(dir, "test.part");
+            string meta = path + ".sha256";
             try
             {
                 File.WriteAllBytes(path, Encoding.ASCII.GetBytes("abc"));
-                Environment.ExitCode = LauncherForm.ComputeSha256(path) ==
-                    "BA7816BF8F01CFEA414140DE5DAE2223B00361A396177A9CB410FF61F20015AD" ? 0 : 1;
+                string hash = "BA7816BF8F01CFEA414140DE5DAE2223B00361A396177A9CB410FF61F20015AD";
+                File.WriteAllText(meta, hash);
+                bool ok = LauncherForm.ComputeSha256(path) == hash &&
+                    LauncherForm.PreparePartial(path, meta, hash, 3) == 3;
+
+                File.WriteAllText(meta, new string('0', 64));
+                ok = ok && LauncherForm.PreparePartial(path, meta, hash, 3) == 0 &&
+                    !File.Exists(path);
+                Environment.ExitCode = ok ? 0 : 1;
             }
-            finally { File.Delete(path); }
+            finally { Directory.Delete(dir, true); }
             return;
         }
 
@@ -366,8 +376,14 @@ class LauncherForm : Form
         _play.Enabled = false;
         try
         {
-            if (UpdateAvailable())
-                await RunUpdate(); // failure is swallowed inside: status set, launch anyway
+            bool updateSucceeded = !UpdateAvailable() || await RunUpdate();
+
+            if (!updateSucceeded && !File.Exists(Path.Combine(_gameDir, _gameExe)))
+            {
+                _busy = false;
+                _play.Enabled = true;
+                return;
+            }
 
             _busy = false;
             _play.Enabled = true;
@@ -395,49 +411,50 @@ class LauncherForm : Form
     }
 
     // full update pipeline: download (manual stream) -> extract -> move-first apply
-    async Task RunUpdate()
+    async Task<bool> RunUpdate()
     {
         string zipUrl = _cdnUrl.TrimEnd('/') + "/Full/PatchGame.zip";
         _dlFileName = Path.GetFileName(new Uri(zipUrl).LocalPath);
-        string tempZip = Path.Combine(Path.GetTempPath(), "PatchGame_update.zip");
-        // delete stale temp zip before download (never reuse a partial file)
-        try { if (File.Exists(tempZip)) File.Delete(tempZip); } catch { }
+        string tempZip = Path.Combine(_gameDir, "PatchGame_update.zip.part");
+        string tempHash = tempZip + ".sha256";
+        bool updateApplied = false;
         try
         {
             string expectedHash = (await Task.Run(() => HttpGetString(zipUrl + ".sha256"))).Trim();
+            if (!IsSha256(expectedHash))
+                throw new Exception("CDN SHA-256 파일 형식이 올바르지 않습니다.");
 
             // 3. download (progress on background thread -> thread-safe fields)
             long size = await Task.Run(() => GetContentLength(zipUrl));
-            Log(string.Format("download start: {0}, size={1} bytes", _dlFileName, size));
+            long resumeOffset = PreparePartial(tempZip, tempHash, expectedHash, size);
+            Log(string.Format("download start: {0}, size={1} bytes, resume={2}",
+                _dlFileName, size, resumeOffset));
 
-            _status.Text = "업데이트 다운로드 중...";
+            _status.Text = resumeOffset > 0 ? "업데이트 다운로드 재개 중..." : "업데이트 다운로드 중...";
             _progress.Visible = true;
             _progressText.Visible = true;
             _phaseDownloading = true;
-            lock (_dlLock) { _bytesReceived = 0; _totalBytes = 0; }
+            lock (_dlLock) { _bytesReceived = resumeOffset; _totalBytes = size; }
             _samples.Clear();
             _lastProgressLogMs = 0;
             _sw.Restart();
 
-            // manual stream download: byte-level progress guaranteed, no WebClient events
-            await Task.Run(() => DownloadStream(zipUrl, tempZip));
+            await Task.Run(() => DownloadStream(zipUrl, tempZip, size));
             _phaseDownloading = false;
 
-            // fallback: on-disk size is ground truth if progress events missed reporting
-            if (_totalBytes <= 0)
-            {
-                lock (_dlLock) { _totalBytes = new FileInfo(tempZip).Length; }
-            }
-
             long elapsedMs = _sw.ElapsedMilliseconds;
-            double avg = elapsedMs > 0 ? _totalBytes / 1048576.0 / (elapsedMs / 1000.0) : 0.0;
-            Log(string.Format("download complete: {0} bytes in {1:F1}s, avg {2:F1} MB/s",
-                _totalBytes, elapsedMs / 1000.0, avg));
+            long downloaded = new FileInfo(tempZip).Length - resumeOffset;
+            double avg = elapsedMs > 0 ? downloaded / 1048576.0 / (elapsedMs / 1000.0) : 0.0;
+            Log(string.Format("download complete: {0} new bytes in {1:F1}s, avg {2:F1} MB/s",
+                downloaded, elapsedMs / 1000.0, avg));
 
             _status.Text = "다운로드 무결성 검사 중...";
             string actualHash = await Task.Run(() => ComputeSha256(tempZip));
             if (!string.Equals(actualHash, expectedHash, StringComparison.OrdinalIgnoreCase))
+            {
+                DeletePartial(tempZip, tempHash);
                 throw new Exception("업데이트 파일 SHA-256 검증에 실패했습니다.");
+            }
             Log("download SHA-256 OK: " + actualHash);
 
             _progress.Visible = false;
@@ -456,16 +473,23 @@ class LauncherForm : Form
             UpdateVersionLabels();
             Log("update applied: " + _latestVersion);
             _status.Text = "업데이트 완료";
+            updateApplied = true;
+            return true;
         }
         catch (Exception ex)
         {
             _phaseDownloading = false;
             Log("update failed: " + ex);
-            _status.Text = "업데이트 실패 — PLAY로 기존 게임 실행";
+            bool installed = File.Exists(Path.Combine(_gameDir, _gameExe));
+            _status.Text = installed ? "업데이트 실패 — 기존 버전을 실행합니다" : "설치 실패 — 다시 시도해 주세요";
+            MessageBox.Show(ex.Message + "\n\n가능한 경우 이어받기 파일을 다음 시도를 위해 보존합니다.\n상세 로그: " +
+                Path.Combine(_gameDir, "Launcher.log"), "업데이트 실패",
+                MessageBoxButtons.OK, MessageBoxIcon.Error);
+            return false;
         }
         finally
         {
-            try { if (File.Exists(tempZip)) File.Delete(tempZip); } catch { }
+            if (updateApplied) DeletePartial(tempZip, tempHash);
             _progress.Visible = false;
             _progressText.Visible = false;
         }
@@ -480,24 +504,36 @@ class LauncherForm : Form
             return resp.ContentLength; // -1 = unknown
     }
 
-    // GET via HttpWebRequest, streamed to disk in 256KB chunks; every chunk updates
-    // the lock-guarded byte counters that the UI timer and 5s progress log read
-    void DownloadStream(string url, string destPath)
+    // Continue a partial file with HTTP Range. Servers that ignore Range safely restart at byte 0.
+    void DownloadStream(string url, string destPath, long expectedSize)
     {
+        long offset = File.Exists(destPath) ? new FileInfo(destPath).Length : 0;
+        if (expectedSize >= 0 && offset == expectedSize) return;
+
         var req = (HttpWebRequest)WebRequest.Create(url);
         req.Method = "GET";
         req.Timeout = HttpTimeoutMs;
+        req.ReadWriteTimeout = HttpTimeoutMs;
+        if (offset > 0) req.AddRange(offset);
 
         using (var resp = (HttpWebResponse)req.GetResponse())
         {
+            bool resumed = offset > 0 && resp.StatusCode == HttpStatusCode.PartialContent;
+            if (offset > 0 && !resumed)
+            {
+                Log("server ignored HTTP Range; restarting download");
+                offset = 0;
+            }
+
             lock (_dlLock)
             {
-                _bytesReceived = 0;
-                _totalBytes = resp.ContentLength > 0 ? resp.ContentLength : 0;
+                _bytesReceived = offset;
+                _totalBytes = expectedSize > 0 ? expectedSize : offset + Math.Max(0, resp.ContentLength);
             }
 
             using (Stream input = resp.GetResponseStream())
-            using (FileStream output = new FileStream(destPath, FileMode.Create, FileAccess.Write))
+            using (FileStream output = new FileStream(destPath,
+                resumed ? FileMode.Append : FileMode.Create, FileAccess.Write, FileShare.Read))
             {
                 byte[] buf = new byte[256 * 1024];
                 int n;
@@ -508,6 +544,37 @@ class LauncherForm : Form
                 }
             }
         }
+
+        if (expectedSize >= 0 && new FileInfo(destPath).Length != expectedSize)
+            throw new Exception("업데이트 파일 크기가 CDN과 일치하지 않습니다.");
+    }
+
+    internal static long PreparePartial(string path, string hashPath, string expectedHash, long expectedSize)
+    {
+        string savedHash = File.Exists(hashPath) ? File.ReadAllText(hashPath).Trim() : "";
+        long length = File.Exists(path) ? new FileInfo(path).Length : 0;
+        if (!string.Equals(savedHash, expectedHash, StringComparison.OrdinalIgnoreCase) ||
+            (expectedSize >= 0 && length > expectedSize))
+        {
+            DeletePartial(path, hashPath);
+            length = 0;
+        }
+        File.WriteAllText(hashPath, expectedHash, new UTF8Encoding(false));
+        return length;
+    }
+
+    static bool IsSha256(string value)
+    {
+        if (value == null || value.Length != 64) return false;
+        foreach (char c in value)
+            if (!Uri.IsHexDigit(c)) return false;
+        return true;
+    }
+
+    static void DeletePartial(string path, string hashPath)
+    {
+        try { if (File.Exists(path)) File.Delete(path); } catch { }
+        try { if (File.Exists(hashPath)) File.Delete(hashPath); } catch { }
     }
 
     // small GET for the version file; returns raw UTF-8 text

@@ -172,6 +172,18 @@ Tools/Scripts/CreatePatchLabel.py
    ```
 3. 생성된 `Launcher.exe`와 `Launcher.ini`를 유저에게 배포합니다.
 
+다운로드가 중단되면 설치 폴더의 `PatchGame_update.zip.part`를 보존합니다. 같은 업데이트를 다시 시도할 때 HTTP Range를 지원하는 CDN이면 받은 지점부터 이어받고, 지원하지 않는 서버면 자동으로 처음부터 다시 받습니다. 버전별 SHA-256이 달라지거나 파일이 손상되면 부분 파일을 폐기합니다.
+
+### 5. 배포 ZIP 만들기
+
+플러그인 개발자용 ZIP과 플레이어용 런처 ZIP을 한 번에 생성합니다:
+
+```powershell
+.\Tools\Scripts\Package-Release.ps1 -EngineRoot "C:\Program Files\Epic Games\UE_5.6"
+```
+
+기본 출력 폴더는 저장소 옆의 `SimpleLauncherPatch-Releases`입니다.
+
 ---
 
 ## 🛠️ 로컬 테스트 환경 구성
@@ -183,7 +195,7 @@ CDN 서버가 없어도 로컬에서 완전한 엔드투엔드 테스트를 진�
 .\Tools\Scripts\Serve-CDN.ps1
 
 # 2. 대역폭 제한(다운로드 속도 시뮬레이션) 테스트 서버 실행 (옵션)
-python .\Tools\Scripts\Throttle-CDN.py --rate 2.5MB
+python .\Tools\Scripts\Throttle-CDN.py 2.5
 ```
 
 ---
