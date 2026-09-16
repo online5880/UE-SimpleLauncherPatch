@@ -36,6 +36,7 @@
        ▼
  1단계: 파일 단위 증분 업데이트
   ├─ 선택적으로 서명된 FullVersion.txt 및 FullManifest.txt 확인
+  ├─ SHA-256 객체 저장소에서 변경 파일만 재사용/다운로드
   ├─ 변경된 exe, DLL, 베이스 엔진 파일만 다운로드
   ├─ 실패 시 이전 파일로 원자적 롤백
   ├─ 필요하면 Launcher.exe 자체 교체 후 재시작
@@ -147,7 +148,7 @@ Tools/Scripts/CreatePatchLabel.py
 # 콘텐츠 패치만 배포할 때 (pakchunk1001.pak + Manifest + Live.txt 생성)
 .\Plugins\SimpleLauncherPatch\Tools\Scripts\Publish-Patch.ps1
 
-# 전체 게임 ZIP과 프로젝트명/실행 파일이 반영된 런처까지 함께 배포
+# 전체 게임과 프로젝트명/실행 파일이 반영된 런처까지 함께 배포
 .\Plugins\SimpleLauncherPatch\Tools\Scripts\Publish-Patch.ps1 -Full
 
 # RSA 서명까지 적용한 전체 배포
@@ -161,9 +162,15 @@ Tools/Scripts/CreatePatchLabel.py
   -EngineRoot "C:\Program Files\Epic Games\UE_5.6" `
   -GameExe MyGame.exe `
   -Full
+
+# 1.3 이하 런처가 아직 설치된 사용자를 위한 1회 호환 배포
+.\Plugins\SimpleLauncherPatch\Tools\Scripts\Publish-Patch.ps1 `
+  -Full -LegacyFiles -LegacyZip
 ```
 
-결과물은 기본적으로 `Tools/Scripts/Cloud`에 생성됩니다. `Full/<BuildId>/Files`에는 버전별 전체 파일, `FullManifest.txt`에는 각 파일의 크기와 SHA-256이 기록됩니다. 이전 런처 마이그레이션용 `PatchGame.zip`도 함께 생성됩니다. 경로를 바꾸려면 `-CloudRoot`를 사용하고, 이미 만들어진 스테이징 빌드를 재사용하려면 `-SkipBuild`를 사용합니다.
+결과물은 기본적으로 `Tools/Scripts/Cloud`에 생성됩니다. 실제 파일은 내용이 같은 경우 한 번만 저장되는 `Full/Objects/<앞 2자리>/<SHA-256>`에 있고, 버전별 `FullManifest.txt`에는 경로·크기·SHA-256이 기록됩니다. 기본값은 최근 3개 전체 버전만 남기고 참조되지 않는 객체를 정리하며, `-KeepFullVersions 5`처럼 조정할 수 있습니다. 경로를 바꾸려면 `-CloudRoot`, 기존 스테이징 빌드를 재사용하려면 `-SkipBuild`를 사용합니다.
+
+기존 1.3 런처가 배포되어 있다면 1.4 첫 배포에만 `-LegacyFiles -LegacyZip`을 붙이십시오. 1.4 런처가 보급된 뒤에는 두 옵션을 빼야 CDN 중복 제거 효과를 온전히 얻습니다.
 
 ---
 
@@ -185,7 +192,7 @@ Tools/Scripts/CreatePatchLabel.py
 
 다운로드가 중단되면 `.launcher-cache/<BuildId>`에 파일별 `.part`를 보존합니다. 같은 업데이트를 다시 시도할 때 HTTP Range를 지원하는 CDN이면 받은 지점부터 이어받고, 지원하지 않는 서버면 자동으로 처음부터 다시 받습니다. 버전별 SHA-256이 달라지거나 파일이 손상되면 부분 파일을 폐기합니다.
 
-> 1.2 이하 런처에는 셀프 업데이트 코드가 없으므로 1.3 런처를 한 번 직접 배포해야 합니다. 이후 버전부터는 `Launcher.exe`도 매니페스트에 포함되어 자동 교체됩니다.
+> 1.2 이하 런처에는 셀프 업데이트 코드가 없으므로 1.3 이상 런처를 한 번 직접 배포해야 합니다. 이후 버전부터는 `Launcher.exe`도 매니페스트에 포함되어 자동 교체됩니다.
 
 프로덕션 배포에서는 먼저 키를 한 번 생성하고 개인 키를 안전한 별도 위치에 보관합니다:
 

@@ -7,9 +7,13 @@ param(
     [string]$Config = "Development",
     [switch]$SkipBuild,
     [switch]$Full,
+    [switch]$LegacyFiles,
+    [switch]$LegacyZip,
     [switch]$ValidateOnly,
     [string]$CloudRoot = "",
-    [string]$SigningKey = ""
+    [string]$SigningKey = "",
+    [ValidateRange(1, 100)]
+    [int]$KeepFullVersions = 3
 )
 
 $ErrorActionPreference = "Stop"
@@ -247,21 +251,47 @@ if ($Full) {
     New-Item -ItemType Directory -Force -Path $FullDir | Out-Null
 
     $VersionDir = Join-Path $FullDir $BuildId
-    $FilesDir = Join-Path $VersionDir "Files"
+    $ObjectsDir = Join-Path $FullDir "Objects"
     if (Test-Path -LiteralPath $VersionDir) { Remove-Item -LiteralPath $VersionDir -Recurse -Force }
-    New-Item -ItemType Directory -Force -Path $FilesDir | Out-Null
-    foreach ($Item in Get-ChildItem -LiteralPath $Layout.StagedDir) {
-        Copy-Item -LiteralPath $Item.FullName -Destination $FilesDir -Recurse -Force
-    }
-    Copy-Item -LiteralPath $LauncherExe -Destination (Join-Path $FilesDir "Launcher.exe") -Force
+    New-Item -ItemType Directory -Force -Path $VersionDir, $ObjectsDir | Out-Null
 
-    $FullEntries = @(Get-ChildItem -LiteralPath $FilesDir -File -Recurse | ForEach-Object {
+    $FullEntries = @(Get-ChildItem -LiteralPath $Layout.StagedDir -File -Recurse | ForEach-Object {
         [PSCustomObject]@{
-            Path = $_.FullName.Substring($FilesDir.Length).TrimStart('\').Replace('\', '/')
+            Path = $_.FullName.Substring($Layout.StagedDir.Length).TrimStart('\').Replace('\', '/')
+            Source = $_.FullName
             Size = $_.Length
             Hash = (Get-FileHash -LiteralPath $_.FullName -Algorithm SHA256).Hash
         }
-    } | Sort-Object Path)
+    })
+    $FullEntries = @($FullEntries | Where-Object { $_.Path -ne "Launcher.exe" }) + @(
+        [PSCustomObject]@{
+            Path = "Launcher.exe"
+            Source = $LauncherExe
+            Size = (Get-Item -LiteralPath $LauncherExe).Length
+            Hash = (Get-FileHash -LiteralPath $LauncherExe -Algorithm SHA256).Hash
+        })
+    $FullEntries = @($FullEntries | Sort-Object Path)
+
+    $NewObjects = 0
+    $ReusedObjects = 0
+    foreach ($Entry in $FullEntries) {
+        $ObjectDir = Join-Path $ObjectsDir $Entry.Hash.Substring(0, 2).ToLowerInvariant()
+        $ObjectPath = Join-Path $ObjectDir $Entry.Hash.ToLowerInvariant()
+        New-Item -ItemType Directory -Force -Path $ObjectDir | Out-Null
+        $ObjectValid = (Test-Path -LiteralPath $ObjectPath -PathType Leaf) -and
+            (Get-Item -LiteralPath $ObjectPath).Length -eq $Entry.Size -and
+            (Get-FileHash -LiteralPath $ObjectPath -Algorithm SHA256).Hash -eq $Entry.Hash
+        if ($ObjectValid) {
+            $ReusedObjects++
+        } else {
+            Copy-Item -LiteralPath $Entry.Source -Destination $ObjectPath -Force
+            if ((Get-FileHash -LiteralPath $ObjectPath -Algorithm SHA256).Hash -ne $Entry.Hash) {
+                Remove-Item -LiteralPath $ObjectPath -Force
+                throw "Object copy verification failed: $($Entry.Path)"
+            }
+            $NewObjects++
+        }
+    }
     $FullManifestLines = [System.Collections.Generic.List[string]]::new()
     $FullManifestLines.Add("`$VERSION = $BuildId")
     $FullManifestLines.Add("`$NUM_ENTRIES = $($FullEntries.Count)")
@@ -271,17 +301,29 @@ if ($Full) {
     $FullManifestPath = Join-Path $VersionDir "FullManifest.txt"
     [System.IO.File]::WriteAllLines($FullManifestPath, $FullManifestLines, [System.Text.UTF8Encoding]::new($false))
 
+    if ($LegacyFiles) {
+        $FilesDir = Join-Path $VersionDir "Files"
+        foreach ($Entry in $FullEntries) {
+            $ObjectPath = Join-Path (Join-Path $ObjectsDir $Entry.Hash.Substring(0, 2).ToLowerInvariant()) $Entry.Hash.ToLowerInvariant()
+            $LegacyPath = Join-Path $FilesDir $Entry.Path.Replace('/', '\')
+            New-Item -ItemType Directory -Force -Path (Split-Path -Parent $LegacyPath) | Out-Null
+            try { New-Item -ItemType HardLink -Path $LegacyPath -Target $ObjectPath -ErrorAction Stop | Out-Null }
+            catch { Copy-Item -LiteralPath $ObjectPath -Destination $LegacyPath -Force }
+        }
+    }
+
     $FullZip = Join-Path $FullDir "PatchGame.zip"
-    if (Test-Path -LiteralPath $FullZip) { Remove-Item -LiteralPath $FullZip -Force }
-
-    $StagedItems = @(Get-ChildItem -LiteralPath $Layout.StagedDir)
-    if ($StagedItems.Count -eq 0) { throw "Staged build is empty: $($Layout.StagedDir)" }
-    $TarArguments = @("-a", "-cf", $FullZip, "-C", $Layout.StagedDir) + @($StagedItems.Name)
-    & tar.exe @TarArguments
-    if ($LASTEXITCODE -ne 0) { throw "tar.exe failed with exit code $LASTEXITCODE" }
-
-    $FullHash = (Get-FileHash -LiteralPath $FullZip -Algorithm SHA256).Hash.ToLowerInvariant()
-    [System.IO.File]::WriteAllText("$FullZip.sha256", $FullHash, [System.Text.UTF8Encoding]::new($false))
+    $FullHash = ""
+    if ($LegacyZip) {
+        if (Test-Path -LiteralPath $FullZip) { Remove-Item -LiteralPath $FullZip -Force }
+        $StagedItems = @(Get-ChildItem -LiteralPath $Layout.StagedDir)
+        if ($StagedItems.Count -eq 0) { throw "Staged build is empty: $($Layout.StagedDir)" }
+        $TarArguments = @("-a", "-cf", $FullZip, "-C", $Layout.StagedDir) + @($StagedItems.Name)
+        & tar.exe @TarArguments
+        if ($LASTEXITCODE -ne 0) { throw "tar.exe failed with exit code $LASTEXITCODE" }
+        $FullHash = (Get-FileHash -LiteralPath $FullZip -Algorithm SHA256).Hash.ToLowerInvariant()
+        [System.IO.File]::WriteAllText("$FullZip.sha256", $FullHash, [System.Text.UTF8Encoding]::new($false))
+    }
     $ManifestPublicKey = ""
     if ($SigningKey) {
         $SigningKey = (Get-Item -LiteralPath $SigningKey -ErrorAction Stop).FullName
@@ -304,6 +346,43 @@ if ($Full) {
         [System.Text.UTF8Encoding]::new($false))
     if ($SigningKey) { Write-RsaSignature $FullVersionPath $SigningKey }
 
+    $VersionDirs = @(Get-ChildItem -LiteralPath $FullDir -Directory |
+        Where-Object { $_.Name -match '^\d+\.\d+\.\d+$' } |
+        Sort-Object { [version]$_.Name } -Descending)
+    $RetainedVersions = @($VersionDirs | Select-Object -First $KeepFullVersions)
+    $ReferencedObjects = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::OrdinalIgnoreCase)
+    foreach ($Retained in $RetainedVersions) {
+        $RetainedManifest = Join-Path $Retained.FullName "FullManifest.txt"
+        if (-not (Test-Path -LiteralPath $RetainedManifest -PathType Leaf)) {
+            throw "Cannot safely clean objects because a retained manifest is missing: $RetainedManifest"
+        }
+        $ExpectedEntries = -1
+        $FoundEntries = 0
+        foreach ($Line in Get-Content -LiteralPath $RetainedManifest) {
+            if ($Line -match '^\$NUM_ENTRIES\s*=\s*(\d+)$') { $ExpectedEntries = [int]$Matches[1] }
+            elseif ($Line -match '\tSHA256:([A-Fa-f0-9]{64})$') {
+                $null = $ReferencedObjects.Add($Matches[1])
+                $FoundEntries++
+            }
+        }
+        if ($ExpectedEntries -lt 0 -or $FoundEntries -ne $ExpectedEntries) {
+            throw "Cannot safely clean objects because a retained manifest is invalid: $RetainedManifest"
+        }
+    }
+    foreach ($OldVersion in @($VersionDirs | Select-Object -Skip $KeepFullVersions)) {
+        Remove-Item -LiteralPath $OldVersion.FullName -Recurse -Force
+    }
+    $PrunedObjects = 0
+    foreach ($Object in @(Get-ChildItem -LiteralPath $ObjectsDir -File -Recurse)) {
+        if (-not $ReferencedObjects.Contains($Object.Name)) {
+            Remove-Item -LiteralPath $Object.FullName -Force
+            $PrunedObjects++
+        }
+    }
+    foreach ($ObjectDir in @(Get-ChildItem -LiteralPath $ObjectsDir -Directory)) {
+        if (-not (Get-ChildItem -LiteralPath $ObjectDir.FullName)) { Remove-Item -LiteralPath $ObjectDir.FullName -Force }
+    }
+
     Copy-Item -LiteralPath $LauncherExe -Destination (Join-Path $FullDir "Launcher.exe") -Force
     $LauncherIni = Get-Content -LiteralPath (Join-Path $LauncherDir "Launcher.ini") -Raw
     $LauncherIni = if ($LauncherIni -match '(?im)^GameExe\s*=') {
@@ -320,11 +399,15 @@ if ($Full) {
         $LauncherIni,
         [System.Text.UTF8Encoding]::new($false))
 
-    $Size = "{0:N1} MB" -f ((Get-Item -LiteralPath $FullZip).Length / 1MB)
-    Write-Host "Full build: $FullZip ($Size)"
+    if ($LegacyZip) {
+        $Size = "{0:N1} MB" -f ((Get-Item -LiteralPath $FullZip).Length / 1MB)
+        Write-Host "Legacy full ZIP: $FullZip ($Size), SHA-256: $FullHash"
+    }
     Write-Host "Game exe: $($Layout.GameExe)"
-    Write-Host "SHA-256: $FullHash"
     Write-Host "FullVersion: $FullDir\FullVersion.txt = $BuildId"
     Write-Host "File manifest: $FullManifestPath ($($FullEntries.Count) files)"
+    Write-Host "Objects: $NewObjects new, $ReusedObjects reused, $PrunedObjects pruned"
+    Write-Host "Retained full versions: $($RetainedVersions.Count) / $KeepFullVersions"
+    if ($LegacyFiles) { Write-Host "Legacy per-version Files: enabled" }
     if ($SigningKey) { Write-Host "RSA signatures: enabled" }
 }

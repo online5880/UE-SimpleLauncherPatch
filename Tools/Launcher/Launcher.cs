@@ -526,10 +526,12 @@ class LauncherForm : Form
                     _totalBytes = totalBytes;
                 }
                 _status.Text = offset > 0 ? "변경 파일 이어받는 중..." : "변경 파일 다운로드 중...";
-                string fileUrl = manifestUrl.Substring(0, manifestUrl.LastIndexOf('/') + 1) +
+                string objectUrl = _cdnUrl.TrimEnd('/') + "/Full/Objects/" +
+                    entry.Hash.Substring(0, 2).ToLowerInvariant() + "/" + entry.Hash.ToLowerInvariant();
+                string legacyUrl = manifestUrl.Substring(0, manifestUrl.LastIndexOf('/') + 1) +
                     "Files/" + EscapeUrlPath(entry.Path);
                 Log(string.Format("file download: {0}, size={1}, resume={2}", entry.Path, entry.Size, offset));
-                await Task.Run(() => DownloadStream(fileUrl, partial, entry.Size, completedBytes, totalBytes));
+                await Task.Run(() => DownloadObject(objectUrl, legacyUrl, partial, entry.Size, completedBytes, totalBytes));
 
                 string actualHash = await Task.Run(() => ComputeSha256(partial));
                 if (!string.Equals(actualHash, entry.Hash, StringComparison.OrdinalIgnoreCase))
@@ -851,6 +853,23 @@ class LauncherForm : Form
     void DownloadStream(string url, string destPath, long expectedSize)
     {
         DownloadStream(url, destPath, expectedSize, 0, expectedSize);
+    }
+
+    void DownloadObject(string objectUrl, string legacyUrl, string destPath, long expectedSize,
+        long completedBytes, long totalBytes)
+    {
+        try
+        {
+            DownloadStream(objectUrl, destPath, expectedSize, completedBytes, totalBytes);
+        }
+        catch (WebException ex)
+        {
+            var response = ex.Response as HttpWebResponse;
+            if (response == null || response.StatusCode != HttpStatusCode.NotFound) throw;
+            response.Close();
+            Log("object not found; legacy Files fallback: " + legacyUrl);
+            DownloadStream(legacyUrl, destPath, expectedSize, completedBytes, totalBytes);
+        }
     }
 
     void DownloadStream(string url, string destPath, long expectedSize, long completedBytes, long totalBytes)
