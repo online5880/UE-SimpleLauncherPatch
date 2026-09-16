@@ -57,7 +57,8 @@ class LauncherForm : Form
     readonly string _gameDir;
     readonly string _exeName;
     string _cdnUrl = "http://127.0.0.1:8080";
-    string _gameExe = "TP_ThirdPerson.exe";
+    string _gameExe = "YourGame.exe";
+    string _gameTitle = "GAME";
 
     readonly Label _badge;
     readonly Label _localVer;
@@ -93,7 +94,7 @@ class LauncherForm : Form
         _exeName = Path.GetFileName(Application.ExecutablePath);
         LoadConfig();
 
-        Text = "PatchGame Launcher";
+        Text = _gameTitle + " Launcher";
         FormBorderStyle = FormBorderStyle.FixedDialog;
         MinimizeBox = false;
         MaximizeBox = false;
@@ -105,7 +106,7 @@ class LauncherForm : Form
         // top bar: game title + version badge
         var title = new Label
         {
-            Text = "PATCH GAME", Font = _titleFont, ForeColor = TitleText,
+            Text = _gameTitle.ToUpperInvariant(), Font = _titleFont, ForeColor = TitleText,
             AutoSize = true, Location = new Point(40, 24), BackColor = Color.Transparent
         };
         _badge = new Label
@@ -132,7 +133,7 @@ class LauncherForm : Form
         };
         var artTitle = new Label
         {
-            Text = "PATCH GAME", Font = _artFont, ForeColor = Color.FromArgb(232, 232, 240),
+            Text = _gameTitle.ToUpperInvariant(), Font = _artFont, ForeColor = Color.FromArgb(232, 232, 240),
             Dock = DockStyle.Fill, TextAlign = ContentAlignment.MiddleCenter,
             BackColor = Color.Transparent
         };
@@ -243,6 +244,7 @@ class LauncherForm : Form
             if (val.Length == 0) continue;
             if (key.Equals("CdnUrl", StringComparison.OrdinalIgnoreCase)) _cdnUrl = val;
             else if (key.Equals("GameExe", StringComparison.OrdinalIgnoreCase)) _gameExe = val;
+            else if (key.Equals("GameTitle", StringComparison.OrdinalIgnoreCase)) _gameTitle = val;
         }
     }
 
@@ -662,7 +664,7 @@ class LauncherForm : Form
         if (!File.Exists(exe))
         {
             FailToLaunch("게임 실행 파일이 없습니다:\n" + exe +
-                "\n\n설치 폴더에 TP_ThirdPerson.exe가 최상위에 있는지 확인하세요.");
+                "\n\n설치 폴더에 " + _gameExe + "가 최상위에 있는지 확인하세요.");
             return;
         }
         try

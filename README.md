@@ -22,6 +22,7 @@
   - 게임 실행 파일 유실 시 자동 복구 및 재설치 지원
 - ⚡ **1-Click 패치 & CDN 퍼블리시 자동화:**
   - PowerShell 스크립트 한 줄로 빌드/쿡/청크 패키징/매니페스트 생성 및 정적 CDN 폴더 배치
+  - `.uproject`, UE 설치 경로, 스테이징 결과와 게임 실행 파일 자동 감지
   - 로컬 테스트용 경량 HTTP 서버 및 대역폭 제한(Throttle) 시뮬레이터 제공
 
 ---
@@ -113,29 +114,43 @@ SimpleLauncherPatch/
 ### 3. 패치 청크 생성 및 배포 (`Tools/Scripts/`)
 
 #### 1) 패치 대상 에셋 라벨링
-에디터 콘솔에서 Python 스크립트를 실행하거나, 콘텐츠 브라우저에서 `Primary Asset Label`을 생성하여 Chunk ID(예: `1001`)를 지정합니다.
+패치할 에셋을 `/Game/PatchContent`에 넣고 에디터에서 Python 스크립트를 실행합니다. 스크립트가 해당 폴더에 Chunk ID `1001`인 `Primary Asset Label`을 만듭니다.
 ```powershell
 # 에디터 Python 콘솔에서 실행
 Tools/Scripts/CreatePatchLabel.py
 ```
 
 #### 2) 원클릭 빌드 & CDN 배포
+프로젝트 루트에서 실행하면 `.uproject`와 `EngineAssociation`에 맞는 UE 설치를 자동으로 찾습니다.
 ```powershell
-# 콘텐츠 패치만 배포할 때 (pakchunk1001.pak + Manifest + Live.txt 생성)
-.\Tools\Scripts\Publish-Patch.ps1
+# 자동 감지만 확인하고 종료
+.\Plugins\SimpleLauncherPatch\Tools\Scripts\Publish-Patch.ps1 -ValidateOnly
 
-# 런처용 전체 게임 ZIP 빌드까지 함께 배포할 때
-.\Tools\Scripts\Publish-Patch.ps1 -Full
+# 콘텐츠 패치만 배포할 때 (pakchunk1001.pak + Manifest + Live.txt 생성)
+.\Plugins\SimpleLauncherPatch\Tools\Scripts\Publish-Patch.ps1
+
+# 전체 게임 ZIP과 프로젝트명/실행 파일이 반영된 런처까지 함께 배포
+.\Plugins\SimpleLauncherPatch\Tools\Scripts\Publish-Patch.ps1 -Full
+
+# 자동 감지가 불가능하거나 후보가 여러 개일 때만 직접 지정
+.\Plugins\SimpleLauncherPatch\Tools\Scripts\Publish-Patch.ps1 `
+  -Project .\MyGame.uproject `
+  -EngineRoot "C:\Program Files\Epic Games\UE_5.6" `
+  -GameExe MyGame.exe `
+  -Full
 ```
+
+결과물은 기본적으로 `Tools/Scripts/Cloud`에 생성됩니다. 경로를 바꾸려면 `-CloudRoot`를 사용하고, 이미 만들어진 스테이징 빌드를 재사용하려면 `-SkipBuild`를 사용합니다.
 
 ---
 
 ### 4. 독립형 런처 빌드 (`Tools/Launcher/`)
 
-1. `Tools/Launcher/Launcher.ini`에서 게임 실행 파일명과 CDN 주소를 설정합니다:
+1. `Tools/Launcher/Launcher.ini`에서 게임명, 실행 파일명과 CDN 주소를 설정합니다. `Publish-Patch.ps1 -Full`을 사용하면 게임명과 실행 파일명은 자동으로 채워집니다:
    ```ini
    CdnUrl=http://127.0.0.1:8080
    GameExe=YourGame.exe
+   GameTitle=Your Game
    ```
 2. `build.cmd`를 실행하면 별도 Visual Studio 설치 없이도 Windows 기본 `csc.exe`를 사용하여 `Launcher.exe`가 1초 만에 빌드됩니다:
    ```cmd

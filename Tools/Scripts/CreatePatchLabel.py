@@ -1,8 +1,8 @@
 import unreal
 
-# Label placed inside /Game/Variant_Combat so the whole folder's assets get labeled
-# into patchable chunk 1001 (b_label_assets_in_my_directory).
-LABEL_PATH = "/Game/Variant_Combat"
+# Put patchable assets in /Game/PatchContent. The label includes that directory
+# in chunk 1001 through label_assets_in_my_directory.
+LABEL_PATH = "/Game/PatchContent"
 LABEL_NAME = "PatchChunk_1001"
 CHUNK_ID = 1001
 
