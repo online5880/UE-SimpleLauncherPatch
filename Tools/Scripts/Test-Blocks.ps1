@@ -61,6 +61,43 @@ try {
         (Get-FileHash "$Install/Fixture/Content/Paks/pakchunk1001-Windows.pak").Hash -ne (Get-FileHash $Pak).Hash -or
         (Get-Content "$Install/FullVersion.txt") -ne '1.0.2') { throw "HTTP delta assertion failed: $Log" }
     Write-Host 'PASS: signed HTTP update downloaded 4MB of 12MB + 17 bytes; final SHA-256 matches'
+    # Same-version repair uses the actual button handler via --repair, without starting the game.
+    $InstalledPak = "$Install/Fixture/Content/Paks/pakchunk1001-Windows.pak"
+    Get-CimInstance Win32_Process | Where-Object { $_.ExecutablePath -eq (Join-Path $Install 'Fixture.exe') } |
+        ForEach-Object { $GameProcess = Get-Process -Id $_.ProcessId -ErrorAction SilentlyContinue; if ($GameProcess -and -not $GameProcess.WaitForExit(10000)) { throw 'Fixture game did not exit' } }
+    $Broken = [byte[]]$Data.Clone()
+    $Broken[4MB] = 77
+    [IO.File]::WriteAllBytes($InstalledPak, $Broken)
+    [IO.File]::Delete("$Install/Fixture.exe")
+    [IO.File]::WriteAllText("$Install/FullManifest.txt", 'damaged local manifest')
+    $Before = @(Get-Content "$TestRoot/http.log" | Where-Object { $_ -match 'GET /Full/Objects/' }).Count
+    $GameStarts = @(Get-Content "$Install/Launcher.log" | Where-Object { $_ -match 'game started' }).Count
+    function Invoke-RepairCheck {
+        $RepairProcess = Start-Process "$Install/Launcher.exe" -ArgumentList '--repair' -WindowStyle Hidden -PassThru
+        if (-not $RepairProcess.WaitForExit(30000)) { Stop-Process -Id $RepairProcess.Id; throw 'Repair timed out' }
+        return $RepairProcess.ExitCode
+    }
+    if ((Invoke-RepairCheck) -ne 0 -or
+        (Get-FileHash $InstalledPak).Hash -ne (Get-FileHash $Pak).Hash -or
+        (Get-FileHash "$Install/Fixture.exe").Hash -ne (Get-FileHash "$Stage/Fixture.exe").Hash -or
+        (Get-Content "$Install/FullVersion.txt") -ne '1.0.2') { throw 'Same-version repair failed' }
+    $After = @(Get-Content "$TestRoot/http.log" | Where-Object { $_ -match 'GET /Full/Objects/' }).Count
+    if ($After - $Before -ne 2) { throw 'Repair must download exactly one Pak block and missing executable' }
+    if ((Invoke-RepairCheck) -ne 0) { throw 'Healthy repair failed' }
+    if (@(Get-Content "$TestRoot/http.log" | Where-Object { $_ -match 'GET /Full/Objects/' }).Count -ne $After -or
+        @(Get-Content "$Install/Launcher.log" | Where-Object { $_ -match 'game started' }).Count -ne $GameStarts) {
+        throw 'Healthy repair downloaded objects or repair started the game'
+    }
+    # Invalid remote signature fails without altering installation or silently using ZIP.
+    $Signature = "$Cloud/Full/1.0.2/FullManifest.txt.sig"
+    $SavedSignature = [IO.File]::ReadAllText($Signature)
+    try {
+        [IO.File]::WriteAllText($Signature, 'invalid-signature')
+        if ((Invoke-RepairCheck) -eq 0 -or (Get-FileHash $InstalledPak).Hash -ne (Get-FileHash $Pak).Hash) {
+            throw 'Invalid signature was accepted or damaged installation'
+        }
+    } finally { [IO.File]::WriteAllText($Signature, $SavedSignature) }
+    Write-Host 'PASS: same-version repair, missing executable, corrupt local manifest, no-op repair, no auto-play, signature failure'
     # Another publish prunes v1 while preserving every block referenced by retained versions.
     & (Join-Path $PSScriptRoot 'Publish-Patch.ps1') @Publish
     if (Test-Path "$Cloud/Full/1.0.1") { throw 'Old version was not pruned' }
@@ -72,4 +109,10 @@ try {
         }
     }
     Write-Host 'PASS: retained-version block objects survive garbage collection'
+    Stop-Process -Id $Server.Id
+    $Server.WaitForExit()
+    if ((Invoke-RepairCheck) -eq 0 -or (Get-FileHash $InstalledPak).Hash -ne (Get-FileHash $Pak).Hash) {
+        throw 'Offline repair did not fail safely'
+    }
+    Write-Host 'PASS: offline repair fails without modifying installed Pak'
 } finally { if (-not $Server.HasExited) { Stop-Process -Id $Server.Id } }

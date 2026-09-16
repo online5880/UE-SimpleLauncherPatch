@@ -60,7 +60,8 @@ static class Program
 
         Application.EnableVisualStyles();
         Application.SetCompatibleTextRenderingDefault(false);
-        Application.Run(new LauncherForm(args.Length > 0 && args[0] == "--play"));
+        Application.Run(new LauncherForm(args.Length > 0 && args[0] == "--play",
+            args.Length > 0 && args[0] == "--repair"));
     }
 }
 
@@ -100,6 +101,9 @@ class LauncherForm : Form
     readonly Label _progressText;
     readonly ProgressBar _progress;
     readonly Button _play;
+    readonly Button _repair;
+    readonly bool _repairAndExit;
+    bool _repairing;
     readonly Timer _uiTimer;
     readonly Stopwatch _sw = new Stopwatch();
     readonly object _dlLock = new object();
@@ -123,9 +127,10 @@ class LauncherForm : Form
     readonly Font _textFont = new Font("Segoe UI", 10.5f);
     readonly Font _playFont = new Font("Segoe UI", 20f, FontStyle.Bold);
 
-    public LauncherForm(bool autoPlay = false)
+    public LauncherForm(bool autoPlay = false, bool repairAndExit = false)
     {
         _autoPlay = autoPlay;
+        _repairAndExit = repairAndExit;
         _gameDir = AppDomain.CurrentDomain.BaseDirectory;
         _exeName = Path.GetFileName(Application.ExecutablePath);
         LoadConfig();
@@ -227,6 +232,17 @@ class LauncherForm : Form
         _play.MouseLeave += (s, e) => _play.BackColor = _play.Enabled ? Green : GreenDisabled;
         _play.Click += (s, e) => PlayClicked();
 
+        _repair = new Button
+        {
+            Text = "검사 및 복구(&R)", AccessibleName = "검사 및 복구",
+            Font = _textFont, ForeColor = TitleText, BackColor = PanelBg,
+            FlatStyle = FlatStyle.Flat, Location = new Point(630, 540), Size = new Size(200, 40),
+            TabIndex = 1
+        };
+        _play.TabIndex = 0;
+        _repair.Click += async (s, e) => await Repair();
+        _play.EnabledChanged += (s, e) => _repair.Enabled = _play.Enabled;
+
         Controls.Add(title);
         Controls.Add(_badge);
         Controls.Add(art);
@@ -236,6 +252,7 @@ class LauncherForm : Form
         Controls.Add(_progressText);
         Controls.Add(_status);
         Controls.Add(_play);
+        Controls.Add(_repair);
 
         _uiTimer = new Timer { Interval = UiTickMs };
         _uiTimer.Tick += (s, e) => OnUiTick();
@@ -392,7 +409,9 @@ class LauncherForm : Form
         {
             _busy = false;
             _play.Enabled = true;
-            if (_autoPlay)
+            if (_repairAndExit)
+                BeginInvoke(new Action(() => _repair.PerformClick()));
+            else if (_autoPlay)
             {
                 _autoPlay = false;
                 BeginInvoke(new Action(PlayClicked));
@@ -436,6 +455,37 @@ class LauncherForm : Form
         }
     }
 
+    async Task Repair()
+    {
+        if (_busy) return;
+        _busy = true;
+        _repairing = true;
+        _play.Enabled = false;
+        bool success = false;
+        try
+        {
+            _status.Text = "복구할 최신 버전 확인 중...";
+            _latestVersion = (await Task.Run(() =>
+                HttpGetVerifiedString(_cdnUrl.TrimEnd('/') + "/Full/FullVersion.txt"))).Trim();
+            if (_latestVersion.Length == 0) throw new Exception("CDN 버전이 비어 있습니다.");
+            UpdateVersionLabels();
+            // Always use the remote manifest, even when local and remote versions match.
+            success = await RunUpdate();
+            if (success && !_selfUpdateScheduled)
+                _status.Text = "검사 및 복구 완료 — PLAY를 눌러 시작하세요";
+            Log("repair completed: success=" + success);
+        }
+        catch (Exception ex) { ReportUpdateFailure(ex, "repair failed"); }
+        finally
+        {
+            _repairing = false;
+            _busy = false;
+            _play.Enabled = true;
+            if (_repairAndExit) Environment.ExitCode = success ? 0 : 1;
+            if (_selfUpdateScheduled || _repairAndExit) Close();
+        }
+    }
+
     bool UpdateAvailable()
     {
         if (!File.Exists(Path.Combine(_gameDir, _gameExe))) return true;
@@ -472,7 +522,7 @@ class LauncherForm : Form
         catch (WebException ex)
         {
             var response = ex.Response as HttpWebResponse;
-            if (!string.IsNullOrEmpty(_manifestPublicKey) ||
+            if (_repairing || !string.IsNullOrEmpty(_manifestPublicKey) ||
                 response == null || response.StatusCode != HttpStatusCode.NotFound)
                 return ReportUpdateFailure(ex, "manifest download failed");
             Log("file manifest not found; using legacy ZIP update");
@@ -497,7 +547,7 @@ class LauncherForm : Form
             var currentPaths = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
             foreach (FullFileEntry entry in entries) currentPaths.Add(entry.Path);
             var obsolete = new List<FullFileEntry>();
-            foreach (FullFileEntry entry in previous)
+            foreach (FullFileEntry entry in _repairing ? new List<FullFileEntry>() : previous)
                 if (!currentPaths.Contains(entry.Path) && !IsLauncherEntry(entry)) obsolete.Add(entry);
 
             long totalBytes = 0;
@@ -547,7 +597,8 @@ class LauncherForm : Form
             _phaseDownloading = false;
 
             _status.Text = "업데이트 적용 중...";
-            await Task.Run(() => ApplyIncremental(changed, obsolete, cacheRoot));
+            if (changed.Count > 0 || obsolete.Count > 0)
+                await Task.Run(() => ApplyIncremental(changed, obsolete, cacheRoot));
             File.WriteAllText(Path.Combine(_gameDir, "FullManifest.txt"), manifestText, new UTF8Encoding(false));
             File.WriteAllText(Path.Combine(_gameDir, "FullVersion.txt"), _latestVersion, new UTF8Encoding(false));
             _currentVersion = _latestVersion;
@@ -714,7 +765,7 @@ class LauncherForm : Form
             "move /Y \"" + BatchPath(newLauncher) + "\" \"" + BatchPath(current) + "\" >NUL\r\n" +
             "if errorlevel 1 exit /b 1\r\n" +
             "rmdir /S /Q \"" + BatchPath(cacheRoot) + "\" 2>NUL\r\n" +
-            "start \"\" \"" + BatchPath(current) + "\" --play\r\n" +
+            "start \"\" \"" + BatchPath(current) + "\"" + (_repairing ? "" : " --play") + "\r\n" +
             "del \"%~f0\"\r\n";
         File.WriteAllText(script, body, Encoding.Default);
         Process.Start(new ProcessStartInfo
@@ -836,6 +887,14 @@ class LauncherForm : Form
     {
         Log(logPrefix + ": " + ex);
         bool installed = File.Exists(Path.Combine(_gameDir, _gameExe));
+        if (_repairing)
+        {
+            _status.Text = "검사 및 복구 실패 — 연결 상태와 로그를 확인해 주세요";
+            if (!_repairAndExit)
+                MessageBox.Show(ex.Message + "\n\n상세 로그: " + Path.Combine(_gameDir, "Launcher.log"),
+                    "검사 및 복구 실패", MessageBoxButtons.OK, MessageBoxIcon.Error);
+            return false;
+        }
         _status.Text = installed ? "업데이트 실패 — 기존 버전을 실행합니다" : "설치 실패 — 다시 시도해 주세요";
         MessageBox.Show(ex.Message + "\n\n가능한 경우 이어받기 파일을 다음 시도를 위해 보존합니다.\n상세 로그: " +
             Path.Combine(_gameDir, "Launcher.log"), "업데이트 실패",
