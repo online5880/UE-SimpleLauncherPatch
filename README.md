@@ -174,6 +174,25 @@ Tools/Scripts/CreatePatchLabel.py
 
 ---
 
+### 발행 전 빌드 건강 검사 (선택)
+
+발행자 PC에서만 쓰는 도구입니다. 배포물(ZIP)에는 들어가지 않고, 플러그인 런타임도 이 도구에 의존하지 않습니다. 패키징된 게임을 한 번 실행해 남은 런타임 로그를 읽어 "이 빌드를 배포해도 되는가"를 판정합니다.
+
+```powershell
+# 키가 없으면 조용히 건너뜁니다(발행은 그대로 진행).
+$env:TYPESAFE_API_KEY = "<key>"
+
+# 특정 로그 한 건만 검사
+./Tools/Scripts/Test-BuildHealth.ps1 -LogPath "Saved/StagedBuilds/Windows/MyGame/Saved/Logs/MyGame.log"
+
+# 판정 로직 자체 점검
+./Tools/Scripts/Test-BuildHealth.ps1 -SelfTest
+```
+
+`Publish-Patch.ps1`은 `Live.txt`를 쓰기 직전에 이 검사를 자동으로 호출합니다. 기본은 경고 전용이고, `-EnforceHealthCheck`를 주었을 때만 판정이 걸린 빌드의 발행을 막습니다. 판정 결과는 `<Project>/Saved/HealthChecks/`에 JSON으로 남습니다.
+
+---
+
 ### 4. 독립형 런처 빌드 (`Tools/Launcher/`)
 
 1.5부터 `Publish-Patch.ps1 -Full`은 4MiB보다 큰 `.pak`·`.ucas`에 대해 4MiB 블록 목록도 자동 생성합니다. 런처는 설치본과 임시 파일의 동일 위치 블록을 SHA-256으로 검사해 재사용하고, 다른 블록만 다운로드합니다. 재조립 파일 전체의 SHA-256까지 통과해야 기존 설치 파일을 교체합니다. 서명을 사용하는 배포에서는 블록 목록도 서명합니다.

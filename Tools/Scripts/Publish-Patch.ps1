@@ -10,6 +10,7 @@ param(
     [switch]$LegacyFiles,
     [switch]$LegacyZip,
     [switch]$ValidateOnly,
+    [switch]$EnforceHealthCheck,
     [string]$CloudRoot = "",
     [string]$SigningKey = "",
     [ValidateRange(1, 100)]
@@ -232,6 +233,19 @@ $ManifestPath = Join-Path $BuildDir "BuildManifest-Windows.txt"
 foreach ($Entry in $Entries) {
     Copy-Item -LiteralPath (Join-Path $PaksDir $Entry.Name) -Destination (Join-Path $BuildWinDir $Entry.Name) -Force
 }
+# 발행자 PC 전용 사전 점검. TYPESAFE_API_KEY 가 없으면 조용히 건너뛴다(플러그인 런타임과 무관).
+# 경고 전용이 기본이고, -EnforceHealthCheck 를 주어야 실제로 발행을 막는다. Live.txt 를 쓰기 직전에 둔다.
+# ponytail: 자식 프로세스로 돌린다. 같은 세션에서 & 로 부르면 자식 스크립트의 exit 이 프로세스 코드로 올라오지 않는다.
+$HealthArgs = @("-NoProfile", "-File", (Join-Path $PSScriptRoot "Test-BuildHealth.ps1"),
+    "-LogPath", (Join-Path $Layout.StagedDir "$ProjectName\Saved\Logs\$ProjectName.log"),
+    "-BuildId", $BuildId,
+    "-OutDir", (Join-Path $ProjectRoot "Saved\HealthChecks"))
+if ($EnforceHealthCheck) { $HealthArgs += "-Enforce" }
+& (Join-Path $PSHOME "pwsh.exe") @HealthArgs
+if ($LASTEXITCODE -ne 0) {
+    throw "Build health check blocked publishing of $BuildId. See $ProjectRoot\Saved\HealthChecks."
+}
+
 [System.IO.File]::WriteAllText($LivePath, $BuildId, [System.Text.UTF8Encoding]::new($false))
 
 $Header = Get-Content -LiteralPath $ManifestPath -TotalCount 1
