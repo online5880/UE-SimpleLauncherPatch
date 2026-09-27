@@ -5,7 +5,12 @@
 #include "Containers/Ticker.h"
 #include "Engine/PrimaryAssetLabel.h"
 #include "Framework/Docking/TabManager.h"
+#include "HAL/PlatformTime.h"
+#include "Misc/AutomationTest.h"
+#include "Misc/CommandLine.h"
 #include "Misc/ConfigCacheIni.h"
+#include "Misc/FileHelper.h"
+#include "Misc/Parse.h"
 #include "Misc/MonitoredProcess.h"
 #include "Misc/Paths.h"
 #include "Misc/PackageName.h"
@@ -46,14 +51,17 @@ public:
     }
 
 private:
+    friend class FSimpleLauncherPatchLocalPublishE2ETest;
     TUniquePtr<FMonitoredProcess> Process;
     FTSTicker::FDelegateHandle TickerHandle;
+    TSharedPtr<SButton> CheckButton;
+    TSharedPtr<SButton> PublishButton;
     FString Status = TEXT("'Check settings' to inspect this project.");
 
     FString ScriptPath() const
     {
         const TSharedPtr<IPlugin> Plugin = IPluginManager::Get().FindPlugin(TEXT("SimpleLauncherPatch"));
-        return Plugin.IsValid() ? Plugin->GetBaseDir() / TEXT("Tools/Scripts/Publish-Patch.ps1") : FString();
+        return Plugin.IsValid() ? FPaths::ConvertRelativePathToFull(Plugin->GetBaseDir() / TEXT("Tools/Scripts/Publish-Patch.ps1")) : FString();
     }
 
     FString CloudPath() const
@@ -148,12 +156,12 @@ private:
                 ]
                 + SScrollBox::Slot().Padding(0, 12)
                 [
-                    SNew(SButton).Text(LOCTEXT("Check", "Check settings"))
+                    SAssignNew(CheckButton, SButton).Text(LOCTEXT("Check", "Check settings"))
                         .OnClicked_Lambda([this]() { OnCheck(); return FReply::Handled(); })
                 ]
                 + SScrollBox::Slot()
                 [
-                    SNew(SButton).Text(LOCTEXT("Publish", "Build and publish locally"))
+                    SAssignNew(PublishButton, SButton).Text(LOCTEXT("Publish", "Build and publish locally"))
                         .IsEnabled_Lambda([this]() { return !Process; })
                         .OnClicked_Lambda([this]() { OnPublish(); return FReply::Handled(); })
                 ]
@@ -167,5 +175,63 @@ private:
 };
 
 IMPLEMENT_MODULE(FSimpleLauncherPatchEditorModule, SimpleLauncherPatchEditor)
+
+#if WITH_DEV_AUTOMATION_TESTS
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(FSimpleLauncherPatchLocalPublishE2ETest,
+    "SimpleLauncherPatch.Editor.LocalPublish", EAutomationTestFlags::EditorContext | EAutomationTestFlags::ProductFilter)
+
+bool FSimpleLauncherPatchLocalPublishE2ETest::RunTest(const FString&)
+{
+    // Opt-in: this test builds and publishes a full game into the current project.
+    if (!FParse::Param(FCommandLine::Get(), TEXT("SimpleLauncherPatchE2E"))) return true;
+    FSimpleLauncherPatchEditorModule& Module = FModuleManager::LoadModuleChecked<FSimpleLauncherPatchEditorModule>("SimpleLauncherPatchEditor");
+    const TSharedPtr<SDockTab> Tab = FGlobalTabmanager::Get()->TryInvokeTab(FName(TEXT("SimpleLauncherPatchPublisher")));
+    if (!TestTrue(TEXT("Publisher tab opens"), Tab.IsValid()) ||
+        !TestTrue(TEXT("Both buttons exist"), Module.CheckButton.IsValid() && Module.PublishButton.IsValid())) return false;
+
+    Module.CheckButton->SimulateClick();
+    if (!TestTrue(TEXT("Project settings are ready"), Module.Status.StartsWith(TEXT("Ready."))))
+    {
+        AddError(Module.Status);
+        return false;
+    }
+    Module.PublishButton->SimulateClick();
+    if (!TestTrue(TEXT("Local publisher starts"), Module.Process.IsValid()))
+    {
+        AddError(Module.Status);
+        return false;
+    }
+
+    const double Deadline = FPlatformTime::Seconds() + 900.0;
+    ADD_LATENT_AUTOMATION_COMMAND(FFunctionLatentCommand([this, &Module, Deadline]()
+    {
+        if (Module.Process)
+        {
+            if (FPlatformTime::Seconds() < Deadline) return false;
+            Module.Process->Cancel(true);
+            AddError(TEXT("Local publish timed out after 15 minutes"));
+            return true;
+        }
+        if (!TestTrue(TEXT("Publisher reports success"), Module.Status.StartsWith(TEXT("Local publish complete:"))))
+        {
+            AddError(Module.Status);
+            return true;
+        }
+        const FString Cloud = Module.CloudPath();
+        FString Live;
+        FString Full;
+        if (!TestTrue(TEXT("Live pointer exists"), FFileHelper::LoadFileToString(Live, *(Cloud / TEXT("Live.txt"))))) return true;
+        if (!TestTrue(TEXT("Full pointer exists"), FFileHelper::LoadFileToString(Full, *(Cloud / TEXT("Full/FullVersion.txt"))))) return true;
+        Live.TrimStartAndEndInline();
+        Full.TrimStartAndEndInline();
+        TestEqual(TEXT("Pointers target the same release"), Live, Full);
+        TestTrue(TEXT("Patch manifest exists"), FPaths::FileExists(Cloud / Live / TEXT("BuildManifest-Windows.txt")));
+        TestTrue(TEXT("Full manifest exists"), FPaths::FileExists(Cloud / TEXT("Full") / Live / TEXT("FullManifest.txt")));
+        TestTrue(TEXT("Launcher exists"), FPaths::FileExists(Cloud / TEXT("Full/Launcher.exe")));
+        return true;
+    }));
+    return true;
+}
+#endif
 
 #undef LOCTEXT_NAMESPACE
