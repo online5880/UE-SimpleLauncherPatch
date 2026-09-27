@@ -103,11 +103,14 @@ SimpleLauncherPatch/
    +CdnBaseUrls="http://127.0.0.1:8080"
 
    [/Script/UnrealEd.ProjectPackagingSettings]
+   bGenerateChunks=True
    bUseIoStore=False
    ```
    > ⚠️ **주의**: URL은 반드시 큰따옴표(`""`)로 감싸야 합니다. 그렇지 않으면 언리얼 엔진 ini 파서가 `//`를 주석으로 인식하여 주소가 잘립니다.
 
    런타임 Pak 마운트를 사용하므로 패키징의 **Use Io Store**는 꺼야 합니다.
+
+4. 에디터의 **Tools → Simple Launcher Patch** 화면에서 **Check settings**로 기본 맵·청크 설정·패치 라벨을 확인합니다. **Build and publish locally**는 게임과 런처를 빌드해 프로젝트의 `Saved/SimpleLauncherPatch/Cloud`에 저장합니다. 서버 업로드는 하지 않으며, 진행 상황은 에디터 Output Log의 `SimpleLauncherPatchEditor` 항목에 표시됩니다. PowerShell 7(`pwsh.exe`)이 필요합니다. 발행 화면은 발행자 전용 건강 검사 및 TypeSafe API를 호출하지 않습니다.
 
 ---
 

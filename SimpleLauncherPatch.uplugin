@@ -19,6 +19,11 @@
 			"Name": "SimpleLauncherPatch",
 			"Type": "Runtime",
 			"LoadingPhase": "Default"
+		},
+		{
+			"Name": "SimpleLauncherPatchEditor",
+			"Type": "Editor",
+			"LoadingPhase": "Default"
 		}
 	],
 	"Plugins": [

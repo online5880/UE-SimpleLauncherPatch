@@ -41,6 +41,22 @@ try {
     New-Item -ItemType Directory -Force -Path $HostSource, $PackagedPlugin | Out-Null
     Copy-Item -Path (Join-Path $TempPackage "*") -Destination $PackagedPlugin -Recurse -Force
 
+    # BuildPlugin copies the whole Tools tree. Replace it with only the local publisher's dependencies.
+    $PackagedTools = Join-Path $PackagedPlugin "Tools"
+    $ResolvedTempRoot = [IO.Path]::GetFullPath($TempRoot).TrimEnd('\') + '\'
+    if (-not [IO.Path]::GetFullPath($PackagedTools).StartsWith($ResolvedTempRoot, [StringComparison]::OrdinalIgnoreCase)) {
+        throw "Refusing to clean Tools outside the temporary package."
+    }
+    if (Test-Path -LiteralPath $PackagedTools) { Remove-Item -LiteralPath $PackagedTools -Recurse -Force }
+    $PackagedScripts = Join-Path $PackagedPlugin "Tools\Scripts"
+    $PackagedLauncher = Join-Path $PackagedPlugin "Tools\Launcher"
+    New-Item -ItemType Directory -Force -Path $PackagedScripts, $PackagedLauncher | Out-Null
+    Copy-Item -LiteralPath (Join-Path $PluginRoot "Tools\Scripts\Publish-Patch.ps1") -Destination $PackagedScripts
+    Copy-Item -LiteralPath (Join-Path $PluginRoot "Tools\Scripts\CreatePatchLabel.py") -Destination $PackagedScripts
+    foreach ($Name in @("Launcher.cs", "Launcher.ini", "build.cmd")) {
+        Copy-Item -LiteralPath (Join-Path $LauncherDir $Name) -Destination $PackagedLauncher
+    }
+
     [IO.File]::WriteAllText((Join-Path $HostRoot "SimpleLauncherPatchHost.uproject"), @'
 {
   "FileVersion": 3,

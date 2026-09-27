@@ -11,6 +11,7 @@ param(
     [switch]$LegacyZip,
     [switch]$ValidateOnly,
     [switch]$EnforceHealthCheck,
+    [switch]$SkipHealthCheck,
     [string]$CloudRoot = "",
     [string]$SigningKey = "",
     [ValidateRange(1, 100)]
@@ -18,6 +19,9 @@ param(
 )
 
 $ErrorActionPreference = "Stop"
+if ($SkipHealthCheck -and $EnforceHealthCheck) {
+    throw "-SkipHealthCheck cannot be used with -EnforceHealthCheck."
+}
 
 function Resolve-ProjectFile([string]$ExplicitProject) {
     if ($ExplicitProject) {
@@ -253,10 +257,12 @@ $HealthArgs = @("-NoProfile", "-File", (Join-Path $PSScriptRoot "Test-BuildHealt
     "-BuildId", $BuildId,
     "-MinLogTimeUtc", $MinLogTimeUtc.ToString("o"),
     "-OutDir", (Join-Path $ProjectRoot "Saved\HealthChecks"))
-if ($EnforceHealthCheck) { $HealthArgs += "-Enforce" }
-& (Join-Path $PSHOME "pwsh.exe") @HealthArgs
-if ($LASTEXITCODE -ne 0) {
-    throw "Build health check blocked publishing of $BuildId. See $ProjectRoot\Saved\HealthChecks."
+if (-not $SkipHealthCheck) {
+    if ($EnforceHealthCheck) { $HealthArgs += "-Enforce" }
+    & (Join-Path $PSHOME "pwsh.exe") @HealthArgs
+    if ($LASTEXITCODE -ne 0) {
+        throw "Build health check blocked publishing of $BuildId. See $ProjectRoot\Saved\HealthChecks."
+    }
 }
 
 if ($Full) {
