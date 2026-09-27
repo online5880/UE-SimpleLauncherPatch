@@ -12,6 +12,7 @@ if ([IO.Path]::GetExtension($ProjectFile) -ne ".uproject") { throw "-Project mus
 $ProjectRoot = Split-Path -Parent $ProjectFile
 $EditorCmd = Join-Path $EngineRoot "Engine\Binaries\Win64\UnrealEditor-Cmd.exe"
 $BuildBat = Join-Path $EngineRoot "Engine\Build\BatchFiles\Build.bat"
+$Python = (Get-Command python -ErrorAction Stop).Source
 foreach ($Path in @($EditorCmd, $BuildBat)) {
     if (-not (Test-Path -LiteralPath $Path -PathType Leaf)) { throw "Required Unreal file is missing: $Path" }
 }
@@ -70,6 +71,82 @@ try {
         throw "E2E output pointers or manifest are invalid. Log: $EditorLog"
     }
     Write-Host "E2E PASS: editor button published $Live to $Cloud"
+
+    $Install = Join-Path $FixtureRoot "Install"
+    New-Item -ItemType Directory -Path $Install | Out-Null
+    Copy-Item -LiteralPath (Join-Path $Cloud "Full\Launcher.exe"), (Join-Path $Cloud "Full\Launcher.ini") -Destination $Install
+    $IniPath = Join-Path $Install "Launcher.ini"
+    $Ini = Get-Content -LiteralPath $IniPath -Raw
+    $GameExeMatch = [regex]::Match($Ini, '(?m)^GameExe\s*=\s*([^\r\n]+)')
+    if (-not $GameExeMatch.Success) { throw "Launcher.ini has no GameExe." }
+    $GameExe = $GameExeMatch.Groups[1].Value.Trim()
+    $MapMatch = [regex]::Match((Get-Content -LiteralPath (Join-Path $FixtureRoot "Config\DefaultEngine.ini") -Raw), '(?m)^GameDefaultMap\s*=\s*(/Game/[^.\r\n]+)')
+    if (-not $MapMatch.Success) { throw "DefaultEngine.ini has no project GameDefaultMap." }
+    $ExpectedMap = $MapMatch.Groups[1].Value
+
+    $PortProbe = [Net.Sockets.TcpListener]::new([Net.IPAddress]::Loopback, 0)
+    $PortProbe.Start()
+    $Port = $PortProbe.LocalEndpoint.Port
+    $PortProbe.Stop()
+    $Ini = $Ini -replace '(?m)^CdnUrl\s*=.*$', "CdnUrl=http://127.0.0.1:$Port"
+    [IO.File]::WriteAllText($IniPath, $Ini)
+    $HttpLog = Join-Path $FixtureRoot "LocalCDN.log"
+    $Server = Start-Process $Python -ArgumentList @(
+        ('"' + (Join-Path $PSScriptRoot "Throttle-CDN.py") + '"'), "128", ('"' + $Cloud + '"'), "$Port"
+    ) -WindowStyle Hidden -PassThru -RedirectStandardError $HttpLog
+    try {
+        $Ready = $false
+        for ($Attempt = 0; $Attempt -lt 30; $Attempt++) {
+            try { $null = Invoke-WebRequest "http://127.0.0.1:$Port/Full/FullVersion.txt" -TimeoutSec 1; $Ready = $true; break }
+            catch { Start-Sleep -Milliseconds 200 }
+        }
+        if (-not $Ready) { throw "Local CDN did not start: $HttpLog" }
+
+        $LaunchStartedUtc = [datetime]::UtcNow
+        $Launcher = Start-Process (Join-Path $Install "Launcher.exe") -ArgumentList "--play" -WindowStyle Hidden -PassThru
+        if (-not $Launcher.WaitForExit(300000)) { Stop-Process -Id $Launcher.Id; throw "Launcher timed out: $Install\Launcher.log" }
+        $LauncherLog = Join-Path $Install "Launcher.log"
+        if (-not (Test-Path -LiteralPath $LauncherLog) -or
+            (Get-Content -LiteralPath $LauncherLog -Raw) -notmatch 'game started' -or
+            (Get-Content -LiteralPath (Join-Path $Install "FullVersion.txt") -Raw).Trim() -ne $Live -or
+            -not (Test-Path -LiteralPath (Join-Path $Install $GameExe))) {
+            throw "Launcher did not install and start $GameExe : $LauncherLog"
+        }
+
+        $ProjectName = [IO.Path]::GetFileNameWithoutExtension($FixtureProject)
+        $GameLog = Join-Path $Install "$ProjectName\Saved\Logs\$ProjectName.log"
+        $MapLoaded = $false
+        $EarliestLogStamp = $LaunchStartedUtc.AddSeconds(-2).ToString('yyyy.MM.dd-HH.mm.ss')
+        for ($Attempt = 0; $Attempt -lt 120; $Attempt++) {
+            if (Test-Path -LiteralPath $GameLog) {
+                $Loads = [regex]::Matches((Get-Content -LiteralPath $GameLog -Raw),
+                    '(?m)^\[(?<time>\d{4}\.\d{2}\.\d{2}-\d{2}\.\d{2}\.\d{2}):[^\r\n]*UEngine::LoadMap Load map complete (?<map>/Game/[^\s\r\n]+)')
+                foreach ($Load in $Loads) {
+                    if ($Load.Groups['map'].Value -eq $ExpectedMap -and
+                        [string]::CompareOrdinal($Load.Groups['time'].Value, $EarliestLogStamp) -ge 0) {
+                        $MapLoaded = $true
+                        break
+                    }
+                }
+                if ($MapLoaded) { break }
+            }
+            Start-Sleep -Seconds 1
+        }
+        if (-not $MapLoaded) { throw "Game did not load $ExpectedMap : $GameLog" }
+        $InstallPrefix = [IO.Path]::GetFullPath($Install).TrimEnd('\') + '\'
+        $GameProcesses = @(Get-CimInstance Win32_Process | Where-Object {
+            $_.ExecutablePath -and $_.ExecutablePath.StartsWith($InstallPrefix, [StringComparison]::OrdinalIgnoreCase)
+        })
+        if ($GameProcesses.Count -eq 0) { throw "Game exited immediately after loading $ExpectedMap : $GameLog" }
+        Write-Host "E2E PASS: launcher installed $Live and game loaded $ExpectedMap"
+    }
+    finally {
+        if ($Server -and -not $Server.HasExited) { Stop-Process -Id $Server.Id }
+        $InstallPrefix = [IO.Path]::GetFullPath($Install).TrimEnd('\') + '\'
+        Get-CimInstance Win32_Process | Where-Object {
+            $_.ExecutablePath -and $_.ExecutablePath.StartsWith($InstallPrefix, [StringComparison]::OrdinalIgnoreCase)
+        } | ForEach-Object { Stop-Process -Id $_.ProcessId -ErrorAction SilentlyContinue }
+    }
     $Succeeded = $true
 }
 finally {

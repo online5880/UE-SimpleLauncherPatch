@@ -112,7 +112,7 @@ SimpleLauncherPatch/
 
 4. 에디터의 **Tools → Simple Launcher Patch** 화면에서 **Check settings**로 기본 맵·청크 설정·패치 라벨을 확인합니다. **Build and publish locally**는 게임과 런처를 빌드해 프로젝트의 `Saved/SimpleLauncherPatch/Cloud`에 저장합니다. 서버 업로드는 하지 않으며, 진행 상황은 에디터 Output Log의 `SimpleLauncherPatchEditor` 항목에 표시됩니다. PowerShell 7(`pwsh.exe`)이 필요합니다. 발행 화면은 발행자 전용 건강 검사 및 TypeSafe API를 호출하지 않습니다.
 
-에디터 화면부터 실제 로컬 발행까지 격리된 프로젝트 복사본으로 확인하려면 `Tools/Scripts/Test-EditorPublishE2E.ps1 -Project <프로젝트.uproject> -EngineRoot <UE_5.6 경로>`를 실행합니다. 성공 시 임시 복사본을 정리하며, `-KeepArtifacts`를 주면 로그와 발행 결과를 남깁니다. 테스트는 서버 업로드를 하지 않습니다.
+에디터 발행부터 런처 설치·게임 실행·기본 맵 로드까지 격리된 프로젝트 복사본으로 확인하려면 `Tools/Scripts/Test-EditorPublishE2E.ps1 -Project <프로젝트.uproject> -EngineRoot <UE_5.6 경로>`를 실행합니다. 로컬 CDN에는 자동 선택된 빈 루프백 포트를 사용하며 외부 서버에 업로드하지 않습니다. 성공 시 게임/서버 프로세스와 임시 복사본을 정리하고, `-KeepArtifacts`를 주면 로그와 발행 결과를 남깁니다. PowerShell 7과 Python이 필요합니다.
 
 ---
 
