@@ -30,19 +30,32 @@ if (-not $Python) {
     exit 1
 }
 
-Start-Process -FilePath $Python.Source `
-    -ArgumentList @("-m", "http.server", "$Port", "--directory", $CloudRoot) `
-    -WindowStyle Hidden
+$Server = Start-Process -FilePath $Python.Source -ArgumentList @(
+    ('"' + (Join-Path $PSScriptRoot "Throttle-CDN.py") + '"'), "64", ('"' + $CloudRoot + '"'), "$Port"
+) -WindowStyle Hidden -PassThru
 
 # health probe — the hidden python can die silently (e.g. port race), so verify for real
 Start-Sleep -Seconds 2
-try {
-    $Resp = Invoke-WebRequest "http://127.0.0.1:$Port/Live.txt" -UseBasicParsing -TimeoutSec 5
-    Write-Host "CDN OK: http://127.0.0.1:$Port/Live.txt -> $($Resp.Content.Trim())"
+$ProbeFailure = $null
+for ($Attempt = 1; $Attempt -le 3; $Attempt++) {
+    try {
+        $Resp = Invoke-WebRequest "http://127.0.0.1:$Port/Live.txt" -UseBasicParsing -TimeoutSec 5
+        $ProbeFailure = $null
+        break
+    } catch {
+        $ProbeFailure = $_
+        if ($Attempt -lt 3) { Start-Sleep -Seconds 1 }
+    }
+}
+if ($ProbeFailure) {
+    Write-Warning "서버 기동 확인 실패: $ProbeFailure"
+} else {
+    $LiveVersion = if ($Resp.Content -is [byte[]]) {
+        [Text.Encoding]::UTF8.GetString($Resp.Content).Trim()
+    } else { ([string]$Resp.Content).Trim() }
+    Write-Host "CDN OK: http://127.0.0.1:$Port/Live.txt -> $LiveVersion"
     Write-Host "CDN root: $CloudRoot"
-    Write-Host "서버는 백그라운드 python 프로세스로 실행 중입니다. 중지: Stop-Process -Name python"
-} catch {
-    Write-Warning "서버 기동 확인 실패: $_"
+    Write-Host "서버는 백그라운드에서 실행 중입니다 (PID $($Server.Id)). 중지: Stop-Process -Id $($Server.Id)"
 }
 
 Wait-Enter

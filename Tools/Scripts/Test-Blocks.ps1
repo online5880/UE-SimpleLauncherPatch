@@ -59,7 +59,9 @@ $Probe.Stop()
 $Ini = [IO.File]::ReadAllText("$Install/Launcher.ini") -replace '(?m)^CdnUrl=.*', "CdnUrl=http://127.0.0.1:$Port"
 [IO.File]::WriteAllText("$Install/Launcher.ini", $Ini)
 $Python = (Get-Command python -ErrorAction Stop).Source
-$Server = Start-Process $Python -ArgumentList "-m http.server $Port --bind 127.0.0.1 --directory `"$Cloud`"" -WindowStyle Hidden -PassThru -RedirectStandardError "$TestRoot/http.log"
+$Server = Start-Process $Python -ArgumentList @(
+    ('"' + (Join-Path $PSScriptRoot 'Throttle-CDN.py') + '"'), '64', ('"' + $Cloud + '"'), "$Port", '1048576'
+) -WindowStyle Hidden -PassThru -RedirectStandardError "$TestRoot/http.log"
 try {
     $Ready = $false
     for ($i = 0; $i -lt 20; $i++) {
@@ -71,7 +73,14 @@ try {
     if (-not $Process.WaitForExit(30000)) { Stop-Process -Id $Process.Id; throw 'Launcher update timed out; inspect artifacts' }
     $Log = Get-Content "$Install/Launcher.log" -Raw
     $ObjectRequests = @(Get-Content "$TestRoot/http.log" | Where-Object { $_ -match 'GET /Full/Objects/' })
-    if ($ObjectRequests.Count -ne 1) { throw 'Expected exactly one block object HTTP request' }
+    $ObjectPaths = @($ObjectRequests | ForEach-Object {
+        [regex]::Match($_, 'GET (/Full/Objects/[^ ]+) HTTP').Groups[1].Value
+    } | Select-Object -Unique)
+    if ($ObjectPaths.Count -ne 1) { throw 'Expected only the changed block object to be requested' }
+    if ($Log -notmatch 'download interrupted; resuming at byte' -or
+        -not (Get-Content "$TestRoot/http.log" | Where-Object { $_ -match 'GET /Full/Objects/.+ 206 -' })) {
+        throw 'Interrupted object download did not resume with HTTP Range'
+    }
     if ($Log -notmatch 'block update: .+, downloaded=4194304, reused=8388625' -or
         (Get-FileHash "$Install/Fixture/Content/Paks/pakchunk1001-Windows.pak").Hash -ne (Get-FileHash $Pak).Hash -or
         (Get-Content "$Install/FullVersion.txt") -ne '1.0.2') { throw "HTTP delta assertion failed: $Log" }
@@ -97,7 +106,11 @@ try {
         (Get-FileHash "$Install/Fixture.exe").Hash -ne (Get-FileHash "$Stage/Fixture.exe").Hash -or
         (Get-Content "$Install/FullVersion.txt") -ne '1.0.2') { throw 'Same-version repair failed' }
     $After = @(Get-Content "$TestRoot/http.log" | Where-Object { $_ -match 'GET /Full/Objects/' }).Count
-    if ($After - $Before -ne 2) { throw 'Repair must download exactly one Pak block and missing executable' }
+    $RepairPaths = @((Get-Content "$TestRoot/http.log" | Where-Object { $_ -match 'GET /Full/Objects/' } |
+        Select-Object -Skip $Before | ForEach-Object {
+            [regex]::Match($_, 'GET (/Full/Objects/[^ ]+) HTTP').Groups[1].Value
+        }) | Select-Object -Unique)
+    if ($RepairPaths.Count -ne 2) { throw 'Repair must download exactly one Pak block and missing executable' }
     if ((Invoke-RepairCheck) -ne 0) { throw 'Healthy repair failed' }
     if (@(Get-Content "$TestRoot/http.log" | Where-Object { $_ -match 'GET /Full/Objects/' }).Count -ne $After -or
         @(Get-Content "$Install/Launcher.log" | Where-Object { $_ -match 'game started' }).Count -ne $GameStarts) {

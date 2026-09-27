@@ -1052,44 +1052,74 @@ class LauncherForm : Form
     {
         long offset = File.Exists(destPath) ? new FileInfo(destPath).Length : 0;
         if (expectedSize >= 0 && offset == expectedSize) return;
-
-        var req = (HttpWebRequest)WebRequest.Create(url);
-        req.Method = "GET";
-        req.Timeout = HttpTimeoutMs;
-        req.ReadWriteTimeout = HttpTimeoutMs;
-        if (offset > 0) req.AddRange(offset);
-
-        using (var resp = (HttpWebResponse)req.GetResponse())
+        int stalled = 0;
+        while (expectedSize < 0 || offset < expectedSize)
         {
-            bool resumed = offset > 0 && resp.StatusCode == HttpStatusCode.PartialContent;
-            if (offset > 0 && !resumed)
+            long before = offset;
+            Exception failure = null;
+            try
             {
-                Log("server ignored HTTP Range; restarting download");
-                offset = 0;
-            }
+                var req = (HttpWebRequest)WebRequest.Create(url);
+                req.Method = "GET";
+                req.Timeout = HttpTimeoutMs;
+                req.ReadWriteTimeout = HttpTimeoutMs;
+                if (offset > 0) req.AddRange(offset);
 
-            lock (_dlLock)
-            {
-                _bytesReceived = completedBytes + offset;
-                _totalBytes = totalBytes > 0 ? totalBytes : completedBytes + offset + Math.Max(0, resp.ContentLength);
-            }
-
-            using (Stream input = resp.GetResponseStream())
-            using (FileStream output = new FileStream(destPath,
-                resumed ? FileMode.Append : FileMode.Create, FileAccess.Write, FileShare.Read))
-            {
-                byte[] buf = new byte[256 * 1024];
-                int n;
-                while ((n = input.Read(buf, 0, buf.Length)) > 0)
+                using (var resp = (HttpWebResponse)req.GetResponse())
                 {
-                    output.Write(buf, 0, n);
-                    lock (_dlLock) { _bytesReceived += n; }
+                    bool resumed = offset > 0 && resp.StatusCode == HttpStatusCode.PartialContent;
+                    string contentRange = resp.Headers["Content-Range"];
+                    if (resumed && (contentRange == null || !contentRange.StartsWith(
+                        "bytes " + offset + "-", StringComparison.OrdinalIgnoreCase)))
+                        throw new Exception("CDN Range 응답 위치가 요청과 다릅니다.");
+                    if (offset > 0 && !resumed)
+                    {
+                        Log("server ignored HTTP Range; restarting download");
+                        offset = 0;
+                    }
+
+                    lock (_dlLock)
+                    {
+                        _bytesReceived = completedBytes + offset;
+                        _totalBytes = totalBytes > 0 ? totalBytes : completedBytes + offset + Math.Max(0, resp.ContentLength);
+                    }
+
+                    using (Stream input = resp.GetResponseStream())
+                    using (FileStream output = new FileStream(destPath,
+                        resumed ? FileMode.Append : FileMode.Create, FileAccess.Write, FileShare.Read))
+                    {
+                        byte[] buf = new byte[256 * 1024];
+                        int n;
+                        while ((n = input.Read(buf, 0, buf.Length)) > 0)
+                        {
+                            output.Write(buf, 0, n);
+                            lock (_dlLock) { _bytesReceived += n; }
+                        }
+                    }
                 }
             }
-        }
+            catch (Exception ex)
+            {
+                if (!IsTransientTransfer(ex)) throw;
+                failure = ex;
+            }
 
-        if (expectedSize >= 0 && new FileInfo(destPath).Length != expectedSize)
+            offset = File.Exists(destPath) ? new FileInfo(destPath).Length : 0;
+            if (expectedSize >= 0 && offset == expectedSize) return;
+            if (failure == null && expectedSize < 0) return;
+            stalled = offset > before ? 0 : stalled + 1;
+            if (stalled >= 3)
+                throw new IOException("다운로드가 반복해서 중단됐습니다: " + url, failure);
+            Log("download interrupted; resuming at byte " + offset);
+        }
+        if (expectedSize >= 0 && offset != expectedSize)
             throw new Exception("업데이트 파일 크기가 CDN과 일치하지 않습니다.");
+    }
+
+    static bool IsTransientTransfer(Exception ex)
+    {
+        var web = ex as WebException;
+        return ex is IOException || (web != null && web.Response == null);
     }
 
     internal static long PreparePartial(string path, string hashPath, string expectedHash, long expectedSize)
@@ -1150,15 +1180,26 @@ class LauncherForm : Form
 
     static byte[] HttpGetBytes(string url)
     {
-        var req = (HttpWebRequest)WebRequest.Create(url);
-        req.Method = "GET";
-        req.Timeout = HttpTimeoutMs;
-        using (var resp = (HttpWebResponse)req.GetResponse())
-        using (Stream input = resp.GetResponseStream())
-        using (var output = new MemoryStream())
+        for (int attempt = 0; ; ++attempt)
         {
-            input.CopyTo(output);
-            return output.ToArray();
+            try
+            {
+                var req = (HttpWebRequest)WebRequest.Create(url);
+                req.Method = "GET";
+                req.Timeout = HttpTimeoutMs;
+                req.ReadWriteTimeout = HttpTimeoutMs;
+                using (var resp = (HttpWebResponse)req.GetResponse())
+                using (Stream input = resp.GetResponseStream())
+                using (var output = new MemoryStream())
+                {
+                    input.CopyTo(output);
+                    return output.ToArray();
+                }
+            }
+            catch (Exception ex)
+            {
+                if (attempt >= 2 || !IsTransientTransfer(ex)) throw;
+            }
         }
     }
 
