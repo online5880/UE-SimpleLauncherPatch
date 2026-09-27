@@ -173,7 +173,9 @@ if ($ValidateOnly) {
 if (-not $CloudRoot) { $CloudRoot = Join-Path $PSScriptRoot "Cloud" }
 $CloudRoot = [System.IO.Path]::GetFullPath($CloudRoot, (Get-Location).Path)
 
+$BuildStartedUtc = $null
 if (-not $SkipBuild) {
+    $BuildStartedUtc = [datetime]::UtcNow
     $UAT = Join-Path $ResolvedEngineRoot "Engine\Build\BatchFiles\RunUAT.bat"
     & $UAT BuildCookRun "-project=$Project" -noP4 -platform=Win64 "-clientconfig=$Config" `
         -cook -allmaps -build -stage -pak -compressed
@@ -198,6 +200,16 @@ if (Test-Path -LiteralPath $LivePath -PathType Leaf) {
 }
 $BuildId = "1.0.$NextNumber"
 Write-Host "Publishing BuildId: $BuildId"
+
+# 새로 빌드했다면 빌드 시작 이후의 로그만, -SkipBuild 라면 스테이징 콘텐츠 이후의 로그만 신뢰한다.
+$MinLogTimeUtc = if ($BuildStartedUtc) { $BuildStartedUtc } else {
+    $LatestUtc = ($ChunkFiles | Sort-Object LastWriteTimeUtc -Descending | Select-Object -First 1).LastWriteTimeUtc
+    if ($Full) {
+        $ExeUtc = (Get-Item -LiteralPath (Join-Path $Layout.StagedDir $Layout.GameExe)).LastWriteTimeUtc
+        if ($ExeUtc -gt $LatestUtc) { $LatestUtc = $ExeUtc }
+    }
+    $LatestUtc
+}
 
 $Sha1 = [System.Security.Cryptography.SHA1]::Create()
 try {
@@ -239,19 +251,13 @@ foreach ($Entry in $Entries) {
 $HealthArgs = @("-NoProfile", "-File", (Join-Path $PSScriptRoot "Test-BuildHealth.ps1"),
     "-LogPath", (Join-Path $Layout.StagedDir "$ProjectName\Saved\Logs\$ProjectName.log"),
     "-BuildId", $BuildId,
+    "-MinLogTimeUtc", $MinLogTimeUtc.ToString("o"),
     "-OutDir", (Join-Path $ProjectRoot "Saved\HealthChecks"))
 if ($EnforceHealthCheck) { $HealthArgs += "-Enforce" }
 & (Join-Path $PSHOME "pwsh.exe") @HealthArgs
 if ($LASTEXITCODE -ne 0) {
     throw "Build health check blocked publishing of $BuildId. See $ProjectRoot\Saved\HealthChecks."
 }
-
-[System.IO.File]::WriteAllText($LivePath, $BuildId, [System.Text.UTF8Encoding]::new($false))
-
-$Header = Get-Content -LiteralPath $ManifestPath -TotalCount 1
-Write-Host "CDN root: $CloudRoot"
-Write-Host "Manifest: $ManifestPath"
-Write-Host "Published $($Entries.Count) file(s), Live.txt = $BuildId ($Header)"
 
 if ($Full) {
     $LauncherDir = Join-Path (Split-Path -Parent $PSScriptRoot) "Launcher"
@@ -390,13 +396,7 @@ if ($Full) {
         }
     }
 
-    # Publish the version pointer only after its immutable manifest and signature are ready.
     $FullVersionPath = Join-Path $FullDir "FullVersion.txt"
-    [System.IO.File]::WriteAllText(
-        $FullVersionPath,
-        $BuildId,
-        [System.Text.UTF8Encoding]::new($false))
-    if ($SigningKey) { Write-RsaSignature $FullVersionPath $SigningKey }
 
     $VersionDirs = @(Get-ChildItem -LiteralPath $FullDir -Directory |
         Where-Object { $_.Name -match '^\d+\.\d+\.\d+$' } |
@@ -433,20 +433,6 @@ if ($Full) {
             }
         }
     }
-    foreach ($OldVersion in @($VersionDirs | Select-Object -Skip $KeepFullVersions)) {
-        Remove-Item -LiteralPath $OldVersion.FullName -Recurse -Force
-    }
-    $PrunedObjects = 0
-    foreach ($Object in @(Get-ChildItem -LiteralPath $ObjectsDir -File -Recurse)) {
-        if (-not $ReferencedObjects.Contains($Object.Name)) {
-            Remove-Item -LiteralPath $Object.FullName -Force
-            $PrunedObjects++
-        }
-    }
-    foreach ($ObjectDir in @(Get-ChildItem -LiteralPath $ObjectsDir -Directory)) {
-        if (-not (Get-ChildItem -LiteralPath $ObjectDir.FullName)) { Remove-Item -LiteralPath $ObjectDir.FullName -Force }
-    }
-
     Copy-Item -LiteralPath $LauncherExe -Destination (Join-Path $FullDir "Launcher.exe") -Force
     $LauncherIni = Get-Content -LiteralPath (Join-Path $LauncherDir "Launcher.ini") -Raw
     $LauncherIni = if ($LauncherIni -match '(?im)^GameExe\s*=') {
@@ -462,6 +448,40 @@ if ($Full) {
         (Join-Path $FullDir "Launcher.ini"),
         $LauncherIni,
         [System.Text.UTF8Encoding]::new($false))
+
+    # 포인터와 서명을 임시 파일에서 완성한 뒤 공개한다. 이전 버전은 공개 후 정리한다.
+    $PendingVersionPath = Join-Path $VersionDir "FullVersion.pending"
+    [System.IO.File]::WriteAllText($PendingVersionPath, $BuildId, [System.Text.UTF8Encoding]::new($false))
+    if ($SigningKey) {
+        Write-RsaSignature $PendingVersionPath $SigningKey
+        Move-Item -LiteralPath "$PendingVersionPath.sig" -Destination "$FullVersionPath.sig" -Force
+    }
+    Move-Item -LiteralPath $PendingVersionPath -Destination $FullVersionPath -Force
+}
+
+[System.IO.File]::WriteAllText($LivePath, $BuildId, [System.Text.UTF8Encoding]::new($false))
+$Header = Get-Content -LiteralPath $ManifestPath -TotalCount 1
+Write-Host "CDN root: $CloudRoot"
+Write-Host "Manifest: $ManifestPath"
+Write-Host "Published $($Entries.Count) file(s), Live.txt = $BuildId ($Header)"
+
+if ($Full) {
+    # ponytail: 정리 실패는 이미 완성된 릴리스를 되돌리지 않는다. 남은 파일은 다음 발행 때 정리된다.
+    $PrunedObjects = 0
+    try {
+        foreach ($OldVersion in @($VersionDirs | Select-Object -Skip $KeepFullVersions)) {
+            Remove-Item -LiteralPath $OldVersion.FullName -Recurse -Force
+        }
+        foreach ($Object in @(Get-ChildItem -LiteralPath $ObjectsDir -File -Recurse)) {
+            if (-not $ReferencedObjects.Contains($Object.Name)) {
+                Remove-Item -LiteralPath $Object.FullName -Force
+                $PrunedObjects++
+            }
+        }
+        foreach ($ObjectDir in @(Get-ChildItem -LiteralPath $ObjectsDir -Directory)) {
+            if (-not (Get-ChildItem -LiteralPath $ObjectDir.FullName)) { Remove-Item -LiteralPath $ObjectDir.FullName -Force }
+        }
+    } catch { Write-Warning "Version cleanup failed after publishing $BuildId : $_" }
 
     if ($LegacyZip) {
         $Size = "{0:N1} MB" -f ((Get-Item -LiteralPath $FullZip).Length / 1MB)

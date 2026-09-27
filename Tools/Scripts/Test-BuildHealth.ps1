@@ -19,6 +19,7 @@ param(
     [string]$LogPath = "",
     [string]$OutDir = "",
     [string]$BuildId = "",
+    [datetime]$MinLogTimeUtc = [datetime]::MinValue,
     [switch]$Enforce,
     [switch]$SelfTest,
     # ponytail: 문턱은 2026-09-17 실측 3건에서 나온 값이다. 표본이 쌓이면 다시 잡아야 한다.
@@ -61,6 +62,12 @@ function Get-FieldValue {
     return $null
 }
 
+function Test-LogCurrent {
+    param($LogItem, [datetime]$MinTimeUtc)
+    return $null -ne $LogItem -and $LogItem.Length -gt 0 -and
+        $LogItem.LastWriteTimeUtc -ge $MinTimeUtc.ToUniversalTime()
+}
+
 if ($SelfTest) {
     # 2026-09-17 실측값. 판정 로직이나 문턱을 건드리면 여기서 깨진다.
     $Cases = @(
@@ -79,6 +86,12 @@ if ($SelfTest) {
         "{0} {1,-30} tripped={2} expect={3}" -f $(if ($Ok) { "PASS" } else { "FAIL" }), $Case.Name, $Tripped, $Case.Expect
     }
     if ($Failed) { "SelfTest FAILED ($Failed case(s))" ; exit 1 }
+    $Cutoff = [datetime]::UtcNow
+    $Fresh = [PSCustomObject]@{ Length = 1; LastWriteTimeUtc = $Cutoff.AddSeconds(1) }
+    $Stale = [PSCustomObject]@{ Length = 1; LastWriteTimeUtc = $Cutoff.AddSeconds(-1) }
+    if (-not (Test-LogCurrent $Fresh $Cutoff) -or (Test-LogCurrent $Stale $Cutoff)) {
+        "SelfTest FAILED (log freshness)"; exit 1
+    }
     "SelfTest OK ($($Cases.Count) cases)"
     exit 0
 }
@@ -90,9 +103,12 @@ $Key = $env:TYPESAFE_API_KEY
 if (-not $Key) { $Key = [Environment]::GetEnvironmentVariable("TYPESAFE_API_KEY", "User") }
 if (-not $Key) { Write-Host "TypeSafe health check: SKIPPED (TYPESAFE_API_KEY not set)" ; exit 0 }
 
-# 로그가 없다고 발행을 막지 않는다. 아직 한 번도 실행하지 않았다는 뜻일 뿐이다.
 $LogItem = Get-Item -LiteralPath $LogPath -ErrorAction SilentlyContinue
-if (-not $LogItem) { Write-Host "TypeSafe health check: SKIPPED (no runtime log at $LogPath)"; exit 0 }
+if (-not (Test-LogCurrent $LogItem $MinLogTimeUtc)) {
+    Write-Warning "TypeSafe health check: SKIPPED (no runtime log newer than $($MinLogTimeUtc.ToUniversalTime().ToString('o')) at $LogPath). Run the staged game, then publish with -SkipBuild."
+    if ($Enforce) { exit 1 }
+    exit 0
+}
 $Tail = (Get-Content -LiteralPath $LogItem.FullName -Tail $TailLines) -join "`n"
 
 $Questions = [ordered]@{
@@ -164,6 +180,7 @@ $Record = [ordered]@{
     log_path         = $LogItem.FullName
     log_bytes        = $LogItem.Length
     log_last_write   = $LogItem.LastWriteTimeUtc.ToString("o")
+    min_log_time_utc = $MinLogTimeUtc.ToUniversalTime().ToString("o")
     session_id       = $LogItem.Name
     model            = $Response.model
     answers          = $Response.answers

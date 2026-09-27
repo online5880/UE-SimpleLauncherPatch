@@ -189,7 +189,9 @@ $env:TYPESAFE_API_KEY = "<key>"
 ./Tools/Scripts/Test-BuildHealth.ps1 -SelfTest
 ```
 
-`Publish-Patch.ps1`은 `Live.txt`를 쓰기 직전에 이 검사를 자동으로 호출합니다. 기본은 경고 전용이고, `-EnforceHealthCheck`를 주었을 때만 판정이 걸린 빌드의 발행을 막습니다. 판정 결과는 `<Project>/Saved/HealthChecks/`에 JSON으로 남습니다.
+`Publish-Patch.ps1`은 이번 스테이징 콘텐츠보다 오래된 런타임 로그를 판정에 쓰지 않습니다. 새로 빌드한 뒤 게임 실행 로그가 없다면 검사를 건너뛰며 경고합니다. 실제 게임을 검사하려면 스테이징 게임을 실행한 다음 `-SkipBuild`로 발행하세요. `-EnforceHealthCheck`를 주면 새 로그가 없거나 판정이 걸린 경우 발행을 멈춥니다. 판정 결과는 `<Project>/Saved/HealthChecks/`에 JSON으로 남습니다.
+
+전체 배포(`-Full`)에서는 매니페스트·블록 파일·런처 설정·서명이 모두 준비된 뒤 `FullVersion.txt`와 `Live.txt`를 갱신합니다.
 
 ---
 

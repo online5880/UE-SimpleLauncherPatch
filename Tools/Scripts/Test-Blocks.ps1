@@ -29,6 +29,21 @@ $Pak = Join-Path $Paks 'pakchunk1001-Windows.pak'
 $Key = (Get-ChildItem "$TestRoot/Keys" -Filter *.private.xml).FullName
 $Publish = @{ Project = "$TestRoot/Fixture.uproject"; SkipBuild = $true; Full = $true; CloudRoot = $Cloud; SigningKey = $Key; KeepFullVersions = 2 }
 & (Join-Path $PSScriptRoot 'Publish-Patch.ps1') @Publish
+$PreviousLive = Get-Content "$Cloud/Live.txt" -Raw
+$PreviousFull = Get-Content "$Cloud/Full/FullVersion.txt" -Raw
+$BrokenPublish = $Publish.Clone()
+$BrokenPublish.SigningKey = "$TestRoot/Missing.private.xml"
+$FailedAsExpected = $false
+try { & (Join-Path $PSScriptRoot 'Publish-Patch.ps1') @BrokenPublish }
+catch {
+    if ($_.Exception.Message -notlike '*Missing.private.xml*') { throw }
+    $FailedAsExpected = $true
+}
+if (-not $FailedAsExpected -or (Get-Content "$Cloud/Live.txt" -Raw) -ne $PreviousLive -or
+    (Get-Content "$Cloud/Full/FullVersion.txt" -Raw) -ne $PreviousFull) {
+    throw 'Failed publish changed a live version pointer'
+}
+Write-Host 'PASS: failed publish keeps both live version pointers'
 Copy-Item "$Stage/*" $Install -Recurse
 Copy-Item "$Cloud/Full/Launcher.exe", "$Cloud/Full/Launcher.ini", "$Cloud/Full/FullVersion.txt" $Install
 Copy-Item "$Cloud/Full/1.0.1/FullManifest.txt" $Install
